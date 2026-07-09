@@ -1,4 +1,4 @@
-// pi-bun-updater installs the official, checksum-verified Pi Bun binary.
+// pi-bun-update installs the official, checksum-verified Pi Bun binary.
 package main
 
 import (
@@ -16,13 +16,19 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
 const defaultRepo = "earendil-works/pi"
 
-var httpClient = &http.Client{Timeout: 5 * time.Minute}
+var (
+	httpClient    = &http.Client{Timeout: 5 * time.Minute}
+	githubAPIBase = "https://api.github.com"
+)
 
 type release struct {
 	TagName string  `json:"tag_name"`
@@ -36,21 +42,59 @@ type asset struct {
 
 type options struct {
 	repo, version, root, binDir, goos, goarch string
-	dryRun, check                             bool
+	dryRun, check, json                       bool
+	keep                                      int
+}
+
+type statusReport struct {
+	ActiveVersion   string   `json:"active_version,omitempty"`
+	ActivePath      string   `json:"active_path,omitempty"`
+	Installed       []string `json:"installed_versions"`
+	LatestVersion   string   `json:"latest_version"`
+	UpToDate        bool     `json:"up_to_date"`
+	UpdateAvailable bool     `json:"update_available"`
+}
+
+type operationReport struct {
+	Action  string   `json:"action"`
+	Version string   `json:"version,omitempty"`
+	Removed []string `json:"removed,omitempty"`
+	DryRun  bool     `json:"dry_run,omitempty"`
+}
+
+type cliExitError struct{ code int }
+
+func (e *cliExitError) Error() string { return fmt.Sprintf("exit %d", e.code) }
+
+func exitCode(err error) int {
+	var exitErr *cliExitError
+	if errors.As(err, &exitErr) {
+		return exitErr.code
+	}
+	if err != nil {
+		return 1
+	}
+	return 0
 }
 
 func main() {
 	if err := run(os.Args[1:], os.Stdout, os.Stderr); err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		os.Exit(1)
+		if exitCode(err) == 1 {
+			fmt.Fprintln(os.Stderr, "error:", err)
+		}
+		os.Exit(exitCode(err))
 	}
 }
 
 func run(args []string, out, errOut io.Writer) error {
-	if len(args) > 0 && args[0] == "update" {
-		args = args[1:]
+	command := "update"
+	if len(args) > 0 {
+		switch args[0] {
+		case "update", "status", "use", "prune":
+			command, args = args[0], args[1:]
+		}
 	}
-	fs := flag.NewFlagSet("pi-bun", flag.ContinueOnError)
+	fs := flag.NewFlagSet("pi-bun-update", flag.ContinueOnError)
 	fs.SetOutput(errOut)
 	var o options
 	fs.StringVar(&o.repo, "repo", defaultRepo, "GitHub owner/repository")
@@ -59,11 +103,13 @@ func run(args []string, out, errOut io.Writer) error {
 	fs.StringVar(&o.binDir, "bin-dir", defaultBinDir(), "directory for the pi-bun symlink")
 	fs.StringVar(&o.goos, "os", runtime.GOOS, "target OS: darwin or linux")
 	fs.StringVar(&o.goarch, "arch", runtime.GOARCH, "target architecture: arm64 or amd64")
-	fs.BoolVar(&o.dryRun, "dry-run", false, "show the release and paths without downloading or changing files")
-	fs.BoolVar(&o.check, "check", false, "show the latest compatible release without changing files")
+	fs.BoolVar(&o.dryRun, "dry-run", false, "show mutations without changing files")
+	fs.BoolVar(&o.check, "check", false, "show release status only (update command alias)")
+	fs.BoolVar(&o.json, "json", false, "emit a machine-readable JSON report")
+	fs.IntVar(&o.keep, "keep", 3, "versions to retain during prune (active version is always retained)")
 	fs.Usage = func() {
-		fmt.Fprintln(errOut, "Usage: pi-bun [update] [flags]")
-		fmt.Fprintln(errOut, "Install the official checksum-verified Pi Bun binary alongside your Node/Pnpm Pi.")
+		fmt.Fprintln(errOut, "Usage: pi-bun-update [update|status|use|prune] [flags] [version]")
+		fmt.Fprintln(errOut, "Install, inspect, activate, and prune the official Pi Bun binary alongside Node/Pnpm Pi.")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -72,40 +118,39 @@ func run(args []string, out, errOut io.Writer) error {
 		}
 		return err
 	}
-	if fs.NArg() != 0 {
-		return fmt.Errorf("unexpected argument %q", fs.Arg(0))
-	}
 	if err := validateRepo(o.repo); err != nil {
 		return err
 	}
-	assetName, err := assetName(o.goos, o.goarch)
-	if err != nil {
-		return err
+	switch command {
+	case "status":
+		if fs.NArg() != 0 {
+			return fmt.Errorf("status accepts no positional arguments")
+		}
+		return showStatus(context.Background(), o, out)
+	case "use":
+		if fs.NArg() != 1 {
+			return fmt.Errorf("use requires exactly one installed version")
+		}
+		return withLock(o.root, func() error { return useVersion(o, fs.Arg(0), out) })
+	case "prune":
+		if fs.NArg() != 0 {
+			return fmt.Errorf("prune accepts no positional arguments")
+		}
+		if o.keep < 0 {
+			return fmt.Errorf("keep must be non-negative")
+		}
+		return withLock(o.root, func() error { return pruneVersions(o, out) })
+	case "update":
+		if fs.NArg() != 0 {
+			return fmt.Errorf("update accepts no positional arguments; use --version")
+		}
+		if o.check {
+			return showStatus(context.Background(), o, out)
+		}
+		return withLock(o.root, func() error { return update(context.Background(), o, out) })
+	default:
+		return fmt.Errorf("unknown command %q", command)
 	}
-	r, err := fetchRelease(context.Background(), o.repo, o.version)
-	if err != nil {
-		return err
-	}
-	if !safeVersion(r.TagName) {
-		return fmt.Errorf("unsafe release tag %q", r.TagName)
-	}
-	binaryAsset, ok := findAsset(r.Assets, assetName)
-	if !ok {
-		return fmt.Errorf("release %s has no asset %q", r.TagName, assetName)
-	}
-	checksums, ok := findAsset(r.Assets, "SHA256SUMS")
-	if !ok {
-		return fmt.Errorf("release %s has no SHA256SUMS asset", r.TagName)
-	}
-	if o.check || o.dryRun {
-		fmt.Fprintf(out, "Pi %s: %s\n", r.TagName, assetName)
-		fmt.Fprintf(out, "install: %s\nactivate: %s\n", filepath.Join(o.root, "versions", r.TagName, "pi", "pi"), filepath.Join(o.binDir, "pi-bun"))
-		return nil
-	}
-	if o.goos != runtime.GOOS || o.goarch != runtime.GOARCH {
-		return fmt.Errorf("refusing to activate target %s/%s from updater running on %s/%s", o.goos, o.goarch, runtime.GOOS, runtime.GOARCH)
-	}
-	return install(context.Background(), o, r.TagName, binaryAsset, checksums, out)
 }
 
 func defaultRoot() string {
@@ -124,6 +169,145 @@ func defaultBinDir() string {
 		return filepath.Join(home, ".local", "bin")
 	}
 	return "."
+}
+
+func update(ctx context.Context, o options, out io.Writer) error {
+	r, binary, checksums, err := resolveRelease(ctx, o)
+	if err != nil {
+		return err
+	}
+	if o.dryRun {
+		return writeReport(out, o.json, operationReport{Action: "update", Version: r.TagName, DryRun: true}, fmt.Sprintf("Would install Pi %s (%s)", r.TagName, binary.Name))
+	}
+	return install(ctx, o, r.TagName, binary, checksums, out)
+}
+
+func showStatus(ctx context.Context, o options, out io.Writer) error {
+	r, _, _, err := resolveRelease(ctx, o)
+	if err != nil {
+		return err
+	}
+	activeVersion, activePath := activeInstallation(o.root, o.binDir)
+	installed, err := installedVersions(o.root)
+	if err != nil {
+		return err
+	}
+	report := statusReport{
+		ActiveVersion: activeVersion, ActivePath: activePath, Installed: installed,
+		LatestVersion: r.TagName, UpToDate: activeVersion == r.TagName,
+		UpdateAvailable: activeVersion != r.TagName,
+	}
+	text := fmt.Sprintf("active: %s\nlatest: %s\nstatus: ", displayVersion(activeVersion), r.TagName)
+	if report.UpToDate {
+		text += "up to date"
+	} else {
+		text += "update available"
+	}
+	if err := writeReport(out, o.json, report, text); err != nil {
+		return err
+	}
+	if report.UpdateAvailable {
+		return &cliExitError{code: 2}
+	}
+	return nil
+}
+
+func useVersion(o options, version string, out io.Writer) error {
+	if !safeVersion(version) {
+		return fmt.Errorf("unsafe version %q", version)
+	}
+	path := filepath.Join(o.root, "versions", version, "pi", "pi")
+	if !isExecutable(path) {
+		return fmt.Errorf("Pi %s is not installed or is incomplete", version)
+	}
+	if o.dryRun {
+		return writeReport(out, o.json, operationReport{Action: "use", Version: version, DryRun: true}, "Would activate Pi "+version)
+	}
+	if err := activate(o.binDir, "pi-bun", path); err != nil {
+		return err
+	}
+	return writeReport(out, o.json, operationReport{Action: "use", Version: version}, "Activated Pi "+version)
+}
+
+func pruneVersions(o options, out io.Writer) error {
+	versions, err := installedVersions(o.root)
+	if err != nil {
+		return err
+	}
+	active, _ := activeInstallation(o.root, o.binDir)
+	keep := map[string]bool{}
+	if active != "" {
+		keep[active] = true
+	}
+	for i, version := range versions {
+		if i >= o.keep {
+			break
+		}
+		keep[version] = true
+	}
+	var removed []string
+	for _, version := range versions {
+		if keep[version] {
+			continue
+		}
+		removed = append(removed, version)
+		if !o.dryRun {
+			if err := os.RemoveAll(filepath.Join(o.root, "versions", version)); err != nil {
+				return err
+			}
+		}
+	}
+	report := operationReport{Action: "prune", Removed: removed, DryRun: o.dryRun}
+	text := "No inactive versions to prune"
+	if len(removed) > 0 {
+		verb := "Pruned"
+		if o.dryRun {
+			verb = "Would prune"
+		}
+		text = verb + ": " + strings.Join(removed, ", ")
+	}
+	return writeReport(out, o.json, report, text)
+}
+
+func resolveRelease(ctx context.Context, o options) (release, asset, asset, error) {
+	if err := validateRepo(o.repo); err != nil {
+		return release{}, asset{}, asset{}, err
+	}
+	name, err := assetName(o.goos, o.goarch)
+	if err != nil {
+		return release{}, asset{}, asset{}, err
+	}
+	r, err := fetchRelease(ctx, o.repo, o.version)
+	if err != nil {
+		return release{}, asset{}, asset{}, err
+	}
+	if !safeVersion(r.TagName) {
+		return release{}, asset{}, asset{}, fmt.Errorf("unsafe release tag %q", r.TagName)
+	}
+	binary, ok := findAsset(r.Assets, name)
+	if !ok {
+		return release{}, asset{}, asset{}, fmt.Errorf("release %s has no asset %q", r.TagName, name)
+	}
+	checksums, ok := findAsset(r.Assets, "SHA256SUMS")
+	if !ok {
+		return release{}, asset{}, asset{}, fmt.Errorf("release %s has no SHA256SUMS asset", r.TagName)
+	}
+	return r, binary, checksums, nil
+}
+
+func writeReport(out io.Writer, asJSON bool, report any, text string) error {
+	if asJSON {
+		return json.NewEncoder(out).Encode(report)
+	}
+	_, err := fmt.Fprintln(out, text)
+	return err
+}
+
+func displayVersion(version string) string {
+	if version == "" {
+		return "none"
+	}
+	return version
 }
 
 func assetName(goos, goarch string) (string, error) {
@@ -150,12 +334,12 @@ func safeVersion(v string) bool {
 }
 
 func fetchRelease(ctx context.Context, repo, version string) (release, error) {
-	endpoint := "https://api.github.com/repos/" + repo + "/releases/latest"
+	endpoint := githubAPIBase + "/repos/" + repo + "/releases/latest"
 	if version != "" {
 		if !safeVersion(version) {
 			return release{}, fmt.Errorf("unsafe version %q", version)
 		}
-		endpoint = "https://api.github.com/repos/" + repo + "/releases/tags/" + version
+		endpoint = githubAPIBase + "/repos/" + repo + "/releases/tags/" + version
 	}
 	var r release
 	if err := getJSON(ctx, endpoint, &r); err != nil {
@@ -178,10 +362,7 @@ func getJSON(ctx context.Context, url string, dst any) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("GET %s: %s", url, resp.Status)
 	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 10<<20)).Decode(dst); err != nil {
-		return err
-	}
-	return nil
+	return json.NewDecoder(io.LimitReader(resp.Body, 10<<20)).Decode(dst)
 }
 
 func findAsset(assets []asset, name string) (asset, bool) {
@@ -194,14 +375,16 @@ func findAsset(assets []asset, name string) (asset, bool) {
 }
 
 func install(ctx context.Context, o options, tag string, binary, checksums asset, out io.Writer) error {
+	if o.goos != runtime.GOOS || o.goarch != runtime.GOARCH {
+		return fmt.Errorf("refusing to activate target %s/%s from updater running on %s/%s", o.goos, o.goarch, runtime.GOOS, runtime.GOARCH)
+	}
 	finalDir := filepath.Join(o.root, "versions", tag)
 	binaryPath := filepath.Join(finalDir, "pi", "pi")
-	if info, err := os.Stat(binaryPath); err == nil && info.Mode().IsRegular() && info.Mode()&0o111 != 0 {
+	if isExecutable(binaryPath) {
 		if err := activate(o.binDir, "pi-bun", binaryPath); err != nil {
 			return err
 		}
-		fmt.Fprintf(out, "Pi %s is already installed; activated %s\n", tag, filepath.Join(o.binDir, "pi-bun"))
-		return nil
+		return writeReport(out, o.json, operationReport{Action: "update", Version: tag}, fmt.Sprintf("Pi %s is already installed; activated %s", tag, filepath.Join(o.binDir, "pi-bun")))
 	}
 	if err := os.MkdirAll(filepath.Join(o.root, "versions"), 0o755); err != nil {
 		return err
@@ -211,8 +394,7 @@ func install(ctx context.Context, o options, tag string, binary, checksums asset
 		return err
 	}
 	defer os.RemoveAll(tmp)
-	checksumFile := filepath.Join(tmp, "SHA256SUMS")
-	archiveFile := filepath.Join(tmp, binary.Name)
+	checksumFile, archiveFile := filepath.Join(tmp, "SHA256SUMS"), filepath.Join(tmp, binary.Name)
 	if err := download(ctx, checksums.URL, checksumFile); err != nil {
 		return fmt.Errorf("download checksums: %w", err)
 	}
@@ -235,26 +417,121 @@ func install(ctx context.Context, o options, tag string, binary, checksums asset
 		return err
 	}
 	stagedBinary := filepath.Join(stage, "pi", "pi")
-	info, err := os.Stat(stagedBinary)
-	if err != nil || !info.Mode().IsRegular() {
+	if !isExecutable(stagedBinary) {
 		return fmt.Errorf("archive does not contain a regular pi/pi executable")
 	}
-	if err := os.Chmod(stagedBinary, info.Mode()|0o755); err != nil {
-		return err
+	if err := os.Rename(stage, finalDir); err != nil && !errors.Is(err, os.ErrExist) {
+		return fmt.Errorf("activate version directory: %w", err)
 	}
-	if err := os.Rename(stage, finalDir); err != nil {
-		if !errors.Is(err, os.ErrExist) {
-			return fmt.Errorf("activate version directory: %w", err)
-		}
-	}
-	if info, err := os.Stat(binaryPath); err != nil || !info.Mode().IsRegular() || info.Mode()&0o111 == 0 {
+	if !isExecutable(binaryPath) {
 		return fmt.Errorf("installed version %s is incomplete", tag)
 	}
 	if err := activate(o.binDir, "pi-bun", binaryPath); err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "Installed Pi %s (%s)\nActivated %s\n", tag, binary.Name, filepath.Join(o.binDir, "pi-bun"))
-	return nil
+	return writeReport(out, o.json, operationReport{Action: "update", Version: tag}, fmt.Sprintf("Installed Pi %s (%s)\nActivated %s", tag, binary.Name, filepath.Join(o.binDir, "pi-bun")))
+}
+
+func isExecutable(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.Mode().IsRegular() && info.Mode()&0o111 != 0
+}
+
+func installedVersions(root string) ([]string, error) {
+	dir := filepath.Join(root, "versions")
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return []string{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	versions := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() && safeVersion(entry.Name()) && isExecutable(filepath.Join(dir, entry.Name(), "pi", "pi")) {
+			versions = append(versions, entry.Name())
+		}
+	}
+	sort.Slice(versions, func(i, j int) bool { return compareVersions(versions[i], versions[j]) > 0 })
+	return versions, nil
+}
+
+func compareVersions(a, b string) int {
+	parse := func(v string) []int {
+		v = strings.TrimPrefix(v, "v")
+		parts := strings.Split(strings.SplitN(v, "-", 2)[0], ".")
+		out := make([]int, len(parts))
+		for i, part := range parts {
+			out[i], _ = strconv.Atoi(part)
+		}
+		return out
+	}
+	aa, bb := parse(a), parse(b)
+	for i := 0; i < len(aa) || i < len(bb); i++ {
+		var av, bv int
+		if i < len(aa) {
+			av = aa[i]
+		}
+		if i < len(bb) {
+			bv = bb[i]
+		}
+		if av > bv {
+			return 1
+		}
+		if av < bv {
+			return -1
+		}
+	}
+	return strings.Compare(a, b)
+}
+
+func activeInstallation(root, binDir string) (string, string) {
+	link := filepath.Join(binDir, "pi-bun")
+	target, err := os.Readlink(link)
+	if err != nil {
+		return "", ""
+	}
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(binDir, target)
+	}
+	target = filepath.Clean(target)
+	versionsRoot := filepath.Join(root, "versions")
+	rel, err := filepath.Rel(versionsRoot, target)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", ""
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	if len(parts) != 3 || parts[1] != "pi" || parts[2] != "pi" || !safeVersion(parts[0]) || !isExecutable(target) {
+		return "", ""
+	}
+	return parts[0], target
+}
+
+func acquireLock(root string) (func(), error) {
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return nil, err
+	}
+	file, err := os.OpenFile(filepath.Join(root, ".update.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = file.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, fmt.Errorf("another pi-bun update is already running")
+		}
+		return nil, err
+	}
+	return func() { _ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN); _ = file.Close() }, nil
+}
+
+func withLock(root string, fn func() error) error {
+	unlock, err := acquireLock(root)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return fn()
 }
 
 func download(ctx context.Context, url, destination string) error {
