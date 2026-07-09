@@ -40,6 +40,17 @@ pi-bun-update --version v0.80.5
 pi-bun-update --dry-run
 ```
 
+## Releases
+
+Pushing a SemVer tag creates a GitHub Release with four statically linked updater archives and a `checksums.txt` manifest through GoReleaser:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The release workflow has only `contents: write` permission and runs from the tagged source. It does not publish to a package registry.
+
 ## Build every supported target
 
 ```bash
