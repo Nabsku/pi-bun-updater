@@ -45,10 +45,30 @@ func TestOperatorLifecycleAgainstReleaseFixture(t *testing.T) {
 
 	root, binDir := filepath.Join(t.TempDir(), "store"), filepath.Join(t.TempDir(), "bin")
 	var stdout, stderr bytes.Buffer
-	if err := run([]string{"update", "--root", root, "--bin-dir", binDir}, &stdout, &stderr); err != nil {
-		t.Fatalf("update: %v; stderr=%s", err, stderr.String())
+	if err := run([]string{"update", "--force", "--root", root, "--bin-dir", binDir}, &stdout, &stderr); err != nil {
+		t.Fatalf("forced update: %v; stderr=%s", err, stderr.String())
 	}
-	if got := runJSON(t, []string{"status", "--json", "--root", root, "--bin-dir", binDir}); !got.UpToDate || got.ActiveVersion != "v9.9.9" || got.LatestVersion != "v9.9.9" {
+	if _, err := os.Lstat(filepath.Join(binDir, "pi")); err != nil {
+		t.Fatalf("forced update did not create pi: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(binDir, "pi-bun")); !os.IsNotExist(err) {
+		t.Fatalf("forced update created pi-bun: %v", err)
+	}
+	if got := runJSON(t, []string{"status", "--force", "--json", "--root", root, "--bin-dir", binDir}); !got.UpToDate || got.ActivationName != "pi" || got.ActiveVersion != "v9.9.9" {
+		t.Fatalf("unexpected forced status: %+v", got)
+	}
+	blockedBin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(blockedBin, "pi"), []byte("foreign"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"update", "--force", "--dry-run", "--root", root, "--bin-dir", blockedBin}, &stdout, &stderr); err == nil || !strings.Contains(err.Error(), "refusing to replace non-symlink") {
+		t.Fatalf("forced update dry-run did not preflight pi: %v", err)
+	}
+
+	if err := run([]string{"update", "--root", root, "--bin-dir", binDir}, &stdout, &stderr); err != nil {
+		t.Fatalf("default update: %v; stderr=%s", err, stderr.String())
+	}
+	if got := runJSON(t, []string{"status", "--json", "--root", root, "--bin-dir", binDir}); !got.UpToDate || got.ActivationName != "pi-bun" || got.ActiveVersion != "v9.9.9" || got.LatestVersion != "v9.9.9" {
 		t.Fatalf("unexpected current status: %+v", got)
 	}
 
