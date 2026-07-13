@@ -19,17 +19,25 @@ There is intentionally no silent background updating. Run `pi-bun-update` when y
 
 ## Install
 
+### Homebrew
+
 ```bash
-git clone https://github.com/Nabsku/pi-bun-updater.git
-cd pi-bun-updater
-go build -o ~/.local/bin/pi-bun-update .
+brew install Nabsku/tap/pi-bun-updater
 
 pi-bun-update status
 pi-bun-update update
 pi-bun --version
 ```
 
-Ensure `~/.local/bin` is on `PATH`.
+### Build from source
+
+```bash
+git clone https://github.com/Nabsku/pi-bun-updater.git
+cd pi-bun-updater
+go build -o ~/.local/bin/pi-bun-update .
+```
+
+Ensure `~/.local/bin` is on `PATH` when building from source.
 
 ## Operator commands
 
@@ -78,7 +86,7 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-The release workflow has only `contents: write` permission and runs from the tagged source. It does not publish to a package registry.
+The release workflow has only `contents: write` permission and runs from the tagged source. The public [`Nabsku/homebrew-tap`](https://github.com/Nabsku/homebrew-tap) independently checks for new releases and opens tested formula update pull requests; this repository holds no tap write credential.
 
 ## Build every supported target
 
