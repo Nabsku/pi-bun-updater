@@ -2,7 +2,7 @@
 
 A small, dependency-free Go updater for the **official compiled Bun build** of [Pi](https://pi.dev/).
 
-It installs alongside the npm/pnpm Pi package; it never replaces `pi`. The active compiled binary is exposed as `pi-bun`, while the updater remains `pi-bun-update`.
+By default it installs alongside the npm/pnpm Pi package and exposes the compiled binary as `pi-bun`; the updater remains `pi-bun-update`. Explicit `--force` mode instead activates the compiled binary as `pi` in the selected bin directory.
 
 ## Safety model
 
@@ -11,8 +11,8 @@ It installs alongside the npm/pnpm Pi package; it never replaces `pi`. The activ
 - Downloads the release archive and upstream `SHA256SUMS`; verifies SHA-256 before extraction.
 - Rejects archive traversal, symlinks, and hardlinks.
 - Stores immutable releases in `~/.local/share/pi-bun/versions/<tag>/`.
-- Atomically repoints `~/.local/bin/pi-bun` only after extraction succeeds.
-- Refuses to overwrite a non-symlink named `pi-bun`.
+- Safely repoints `~/.local/bin/pi-bun` by default, or `~/.local/bin/pi` with explicit `--force`, only after extraction succeeds.
+- Refuses to overwrite a non-symlink activation target; `--force` may replace an existing `pi` symlink but never a regular executable.
 - Takes a non-blocking per-store lock for `update`, `use`, and `prune`, preventing concurrent activation races.
 
 There is intentionally no silent background updating. Run `pi-bun-update` when you choose to update, or use `status` / `update --check` from an explicit scheduler policy.
@@ -53,7 +53,21 @@ pi-bun-update prune --keep 3
 pi-bun-update prune --keep 3 --dry-run
 ```
 
-All structured reports support `--json`. A `status` report includes `active_version`, `latest_version`, `installed_versions`, `up_to_date`, and `update_available`.
+### Activate directly as `pi`
+
+`--force` changes the managed activation name from `pi-bun` to `pi`:
+
+```bash
+pi-bun-update update --force
+pi-bun-update status --force
+pi-bun-update use --force v0.80.4
+pi-bun-update prune --force --keep 3
+pi --version
+```
+
+Use `--force` consistently for `update`, `status`, and `use`; those commands operate on the selected activation symlink. `prune` always protects versions referenced by both managed names (`pi-bun` and `pi`), regardless of the flag. This creates `pi` only in `--bin-dir` and does not uninstall the npm/pnpm Pi package. Your `PATH` order decides which `pi` command wins. A regular existing `pi` executable is never overwritten.
+
+All structured reports support `--json`. A `status` report includes `activation_name`, `active_version`, `latest_version`, `installed_versions`, `up_to_date`, and `update_available`.
 
 ## Releases
 
@@ -85,6 +99,7 @@ This writes four statically-linked updater binaries to `dist/`: Darwin/Linux × 
 -check                  status-only alias for update
 -dry-run                preview update/use/prune mutations
 -json                   emit machine-readable reports
+-force                  activate as pi instead of pi-bun
 -keep N                 retained newest versions for prune (default: 3)
 ```
 

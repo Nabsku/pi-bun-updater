@@ -47,11 +47,12 @@ type asset struct {
 
 type options struct {
 	repo, version, root, binDir, goos, goarch string
-	dryRun, check, json                       bool
+	dryRun, check, json, force                bool
 	keep                                      int
 }
 
 type statusReport struct {
+	ActivationName  string   `json:"activation_name"`
 	ActiveVersion   string   `json:"active_version"`
 	ActivePath      string   `json:"active_path"`
 	Installed       []string `json:"installed_versions"`
@@ -61,10 +62,12 @@ type statusReport struct {
 }
 
 type operationReport struct {
-	Action  string   `json:"action"`
-	Version string   `json:"version,omitempty"`
-	Removed []string `json:"removed,omitempty"`
-	DryRun  bool     `json:"dry_run,omitempty"`
+	Action               string   `json:"action"`
+	ActivationName       string   `json:"activation_name,omitempty"`
+	ProtectedActivations []string `json:"protected_activations,omitempty"`
+	Version              string   `json:"version,omitempty"`
+	Removed              []string `json:"removed,omitempty"`
+	DryRun               bool     `json:"dry_run,omitempty"`
 }
 
 type cliExitError struct{ code int }
@@ -111,6 +114,7 @@ func run(args []string, out, errOut io.Writer) error {
 	fs.BoolVar(&o.dryRun, "dry-run", false, "show mutations without changing files")
 	fs.BoolVar(&o.check, "check", false, "show release status only (update command alias)")
 	fs.BoolVar(&o.json, "json", false, "emit a machine-readable JSON report")
+	fs.BoolVar(&o.force, "force", false, "activate as pi instead of pi-bun (may replace an existing pi symlink)")
 	fs.IntVar(&o.keep, "keep", 3, "versions to retain during prune (active version is always retained)")
 	fs.Usage = func() {
 		fmt.Fprintln(errOut, "Usage: pi-bun-update [update|status|use|prune] [flags] [version]")
@@ -192,13 +196,24 @@ func normalizePaths(o *options) error {
 	return nil
 }
 
+func activationName(o options) string {
+	if o.force {
+		return "pi"
+	}
+	return "pi-bun"
+}
+
 func update(ctx context.Context, o options, out io.Writer) error {
 	r, binary, checksums, err := resolveRelease(ctx, o)
 	if err != nil {
 		return err
 	}
 	if o.dryRun {
-		return writeReport(out, o.json, operationReport{Action: "update", Version: r.TagName, DryRun: true}, fmt.Sprintf("Would install Pi %s (%s)", r.TagName, binary.Name))
+		name := activationName(o)
+		if err := preflightActivation(o.binDir, name); err != nil {
+			return err
+		}
+		return writeReport(out, o.json, operationReport{Action: "update", ActivationName: name, Version: r.TagName, DryRun: true}, fmt.Sprintf("Would install Pi %s (%s) and activate it as %s", r.TagName, binary.Name, name))
 	}
 	return install(ctx, o, r.TagName, binary, checksums, out)
 }
@@ -208,17 +223,19 @@ func showStatus(ctx context.Context, o options, out io.Writer) error {
 	if err != nil {
 		return err
 	}
-	activeVersion, activePath := activeInstallation(o.root, o.binDir)
+	name := activationName(o)
+	activeVersion, activePath := activeInstallation(o.root, o.binDir, name)
 	installed, err := installedVersions(o.root)
 	if err != nil {
 		return err
 	}
 	report := statusReport{
-		ActiveVersion: activeVersion, ActivePath: activePath, Installed: installed,
+		ActivationName: name,
+		ActiveVersion:  activeVersion, ActivePath: activePath, Installed: installed,
 		LatestVersion: r.TagName, UpToDate: activeVersion == r.TagName,
 		UpdateAvailable: activeVersion != r.TagName,
 	}
-	text := fmt.Sprintf("active: %s\nlatest: %s\nstatus: ", displayVersion(activeVersion), r.TagName)
+	text := fmt.Sprintf("activation: %s\nactive: %s\nlatest: %s\nstatus: ", name, displayVersion(activeVersion), r.TagName)
 	if report.UpToDate {
 		text += "up to date"
 	} else {
@@ -241,13 +258,17 @@ func useVersion(o options, version string, out io.Writer) error {
 	if !ok {
 		return fmt.Errorf("Pi %s is not installed or is incomplete", version)
 	}
+	name := activationName(o)
 	if o.dryRun {
-		return writeReport(out, o.json, operationReport{Action: "use", Version: version, DryRun: true}, "Would activate Pi "+version)
+		if err := preflightActivation(o.binDir, name); err != nil {
+			return err
+		}
+		return writeReport(out, o.json, operationReport{Action: "use", ActivationName: name, Version: version, DryRun: true}, fmt.Sprintf("Would activate Pi %s as %s", version, name))
 	}
-	if err := activate(o.binDir, "pi-bun", path); err != nil {
+	if err := activate(o.binDir, name, path); err != nil {
 		return err
 	}
-	return writeReport(out, o.json, operationReport{Action: "use", Version: version}, "Activated Pi "+version)
+	return writeReport(out, o.json, operationReport{Action: "use", ActivationName: name, Version: version}, fmt.Sprintf("Activated Pi %s as %s", version, name))
 }
 
 func pruneVersions(o options, out io.Writer) error {
@@ -255,10 +276,15 @@ func pruneVersions(o options, out io.Writer) error {
 	if err != nil {
 		return err
 	}
-	active, _ := activeInstallation(o.root, o.binDir)
 	keep := map[string]bool{}
-	if active != "" {
+	protected := make([]string, 0, 2)
+	for _, name := range []string{"pi-bun", "pi"} {
+		active, _ := activeInstallation(o.root, o.binDir, name)
+		if active == "" {
+			continue
+		}
 		keep[active] = true
+		protected = append(protected, name+"="+active)
 	}
 	for i, version := range versions {
 		if i >= o.keep {
@@ -278,7 +304,13 @@ func pruneVersions(o options, out io.Writer) error {
 			}
 		}
 	}
-	report := operationReport{Action: "prune", Removed: removed, DryRun: o.dryRun}
+	report := operationReport{
+		Action:               "prune",
+		ActivationName:       activationName(o),
+		ProtectedActivations: protected,
+		Removed:              removed,
+		DryRun:               o.dryRun,
+	}
 	text := "No inactive versions to prune"
 	if len(removed) > 0 {
 		verb := "Pruned"
@@ -451,13 +483,14 @@ func install(ctx context.Context, o options, tag string, binary, checksums asset
 	if err := ensureStoreLayout(o.root); err != nil {
 		return err
 	}
+	linkName := activationName(o)
 	finalDir := filepath.Join(o.root, "versions", tag)
 	binaryPath, alreadyInstalled := installedBinary(o.root, tag)
 	if alreadyInstalled {
-		if err := activate(o.binDir, "pi-bun", binaryPath); err != nil {
+		if err := activate(o.binDir, linkName, binaryPath); err != nil {
 			return err
 		}
-		return writeReport(out, o.json, operationReport{Action: "update", Version: tag}, fmt.Sprintf("Pi %s is already installed; activated %s", tag, filepath.Join(o.binDir, "pi-bun")))
+		return writeReport(out, o.json, operationReport{Action: "update", ActivationName: linkName, Version: tag}, fmt.Sprintf("Pi %s is already installed; activated %s", tag, filepath.Join(o.binDir, linkName)))
 	}
 	if err := os.MkdirAll(filepath.Join(o.root, "versions"), 0o755); err != nil {
 		return err
@@ -500,10 +533,10 @@ func install(ctx context.Context, o options, tag string, binary, checksums asset
 	if !alreadyInstalled {
 		return fmt.Errorf("installed version %s is incomplete", tag)
 	}
-	if err := activate(o.binDir, "pi-bun", binaryPath); err != nil {
+	if err := activate(o.binDir, linkName, binaryPath); err != nil {
 		return err
 	}
-	return writeReport(out, o.json, operationReport{Action: "update", Version: tag}, fmt.Sprintf("Installed Pi %s (%s)\nActivated %s", tag, binary.Name, filepath.Join(o.binDir, "pi-bun")))
+	return writeReport(out, o.json, operationReport{Action: "update", ActivationName: linkName, Version: tag}, fmt.Sprintf("Installed Pi %s (%s)\nActivated %s", tag, binary.Name, filepath.Join(o.binDir, linkName)))
 }
 
 func isRegularExecutable(path string) bool {
@@ -632,8 +665,8 @@ func compareVersions(a, b string) int {
 	return 0
 }
 
-func activeInstallation(root, binDir string) (string, string) {
-	link := filepath.Join(binDir, "pi-bun")
+func activeInstallation(root, binDir, name string) (string, string) {
+	link := filepath.Join(binDir, name)
 	target, err := os.Readlink(link)
 	if err != nil {
 		return "", ""
@@ -833,20 +866,70 @@ func safeArchivePath(root, name string) (string, error) {
 	return filepath.Join(root, clean), nil
 }
 
+func preflightActivation(binDir, name string) error {
+	link := filepath.Join(binDir, name)
+	info, err := os.Lstat(link)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		return fmt.Errorf("refusing to replace non-symlink %s", link)
+	}
+	return nil
+}
+
 func activate(binDir, name, target string) error {
 	if err := os.MkdirAll(binDir, 0o755); err != nil {
 		return err
 	}
+	if err := preflightActivation(binDir, name); err != nil {
+		return err
+	}
 	link := filepath.Join(binDir, name)
-	if info, err := os.Lstat(link); err == nil && info.Mode()&os.ModeSymlink == 0 {
-		return fmt.Errorf("refusing to replace non-symlink %s", link)
-	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Lstat(link); errors.Is(err, os.ErrNotExist) {
+		if err := os.Symlink(target, link); err != nil {
+			return fmt.Errorf("create activation symlink: %w", err)
+		}
+		return nil
+	} else if err != nil {
 		return err
 	}
-	tmp := link + fmt.Sprintf(".next-%d", os.Getpid())
-	if err := os.Symlink(target, tmp); err != nil {
+
+	swapDir, err := os.MkdirTemp(binDir, "."+name+".swap-")
+	if err != nil {
 		return err
 	}
-	defer os.Remove(tmp)
-	return os.Rename(tmp, link)
+	backup := filepath.Join(swapDir, "previous")
+	if err := os.Rename(link, backup); err != nil {
+		_ = os.Remove(swapDir)
+		return err
+	}
+	backupInfo, err := os.Lstat(backup)
+	if err != nil {
+		return fmt.Errorf("inspect moved activation target %s: %w", backup, err)
+	}
+	if backupInfo.Mode()&os.ModeSymlink == 0 {
+		if backupInfo.Mode().IsRegular() {
+			if restoreErr := os.Link(backup, link); restoreErr == nil {
+				_ = os.Remove(backup)
+				_ = os.Remove(swapDir)
+				return fmt.Errorf("refusing to replace non-symlink %s", link)
+			}
+		}
+		return fmt.Errorf("activation target changed concurrently; preserved at %s", backup)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		oldTarget, readErr := os.Readlink(backup)
+		if readErr == nil {
+			_ = os.Symlink(oldTarget, link)
+		}
+		return fmt.Errorf("activation target changed concurrently; previous symlink preserved at %s: %w", backup, err)
+	}
+	if err := os.Remove(backup); err != nil {
+		return err
+	}
+	return os.Remove(swapDir)
 }
