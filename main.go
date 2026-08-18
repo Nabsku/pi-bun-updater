@@ -5,7 +5,6 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"context"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -16,7 +15,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -28,6 +26,7 @@ const (
 	maxArchiveEntries   = 4096
 	maxArchiveFileBytes = 128 << 20
 	maxArchiveBytes     = 256 << 20
+	maxChecksumBytes    = 1 << 20
 )
 
 var (
@@ -45,6 +44,13 @@ type asset struct {
 	URL  string `json:"browser_download_url"`
 }
 
+type releaseTarget struct {
+	Release       release
+	Binary        asset
+	Checksums     asset
+	ArchiveSHA256 string
+}
+
 type options struct {
 	repo, version, root, binDir, goos, goarch string
 	dryRun, check, json, force                bool
@@ -57,6 +63,8 @@ type statusReport struct {
 	ActivePath      string   `json:"active_path"`
 	Installed       []string `json:"installed_versions"`
 	LatestVersion   string   `json:"latest_version"`
+	Status          string   `json:"status"`
+	Reason          string   `json:"reason,omitempty"`
 	UpToDate        bool     `json:"up_to_date"`
 	UpdateAvailable bool     `json:"update_available"`
 }
@@ -70,7 +78,10 @@ type operationReport struct {
 	DryRun               bool     `json:"dry_run,omitempty"`
 }
 
-type cliExitError struct{ code int }
+type cliExitError struct {
+	code   int
+	silent bool
+}
 
 func (e *cliExitError) Error() string { return fmt.Sprintf("exit %d", e.code) }
 
@@ -87,7 +98,8 @@ func exitCode(err error) int {
 
 func main() {
 	if err := run(os.Args[1:], os.Stdout, os.Stderr); err != nil {
-		if exitCode(err) == 1 {
+		var exitErr *cliExitError
+		if exitCode(err) == 1 && (!errors.As(err, &exitErr) || !exitErr.silent) {
 			fmt.Fprintln(os.Stderr, "error:", err)
 		}
 		os.Exit(exitCode(err))
@@ -130,9 +142,11 @@ func run(args []string, out, errOut io.Writer) error {
 	if err := normalizePaths(&o); err != nil {
 		return err
 	}
-	if err := validateRepo(o.repo); err != nil {
+	repository, err := canonicalRepository(o.repo)
+	if err != nil {
 		return err
 	}
+	o.repo = repository
 	switch command {
 	case "status":
 		if fs.NArg() != 0 {
@@ -203,61 +217,143 @@ func activationName(o options) string {
 	return "pi-bun"
 }
 
+const (
+	statusNotInstalled = "not_installed"
+	statusCurrent      = "current"
+	statusBehind       = "behind"
+	statusAhead        = "ahead"
+	statusCorrupt      = "corrupt"
+)
+
+type statusEvaluation struct {
+	Status string
+	Reason string
+}
+
+func evaluateStatus(o options, target releaseTarget, active activationInspection) statusEvaluation {
+	if !active.Exists {
+		return statusEvaluation{Status: statusNotInstalled}
+	}
+	if active.Err != nil || active.Installation == nil {
+		reason := "activation_invalid"
+		if active.LegacyVersion != "" {
+			reason = "legacy_unverified"
+		}
+		return statusEvaluation{Status: statusCorrupt, Reason: reason}
+	}
+	inst := *active.Installation
+	if !installationMatchesOptions(inst, o) {
+		return statusEvaluation{Status: statusCorrupt, Reason: "provenance_mismatch"}
+	}
+	comparison := compareVersions(inst.Manifest.Tag, target.Release.TagName)
+	if comparison < 0 {
+		return statusEvaluation{Status: statusBehind}
+	}
+	if comparison > 0 {
+		return statusEvaluation{Status: statusAhead}
+	}
+	if inst.Manifest.Tag != target.Release.TagName || inst.Manifest.Asset != target.Binary.Name || inst.Manifest.ArchiveSHA256 != target.ArchiveSHA256 {
+		return statusEvaluation{Status: statusCorrupt, Reason: "target_identity_mismatch"}
+	}
+	return statusEvaluation{Status: statusCurrent}
+}
+
+func activeVersion(active activationInspection) string {
+	if active.Installation != nil {
+		return active.Installation.Manifest.Tag
+	}
+	return active.LegacyVersion
+}
+
 func update(ctx context.Context, o options, out io.Writer) error {
-	r, binary, checksums, err := resolveRelease(ctx, o)
+	name := activationName(o)
+	if !o.dryRun {
+		if err := recoverActivationSwaps(o.binDir, name); err != nil {
+			return err
+		}
+	}
+	target, err := resolveTarget(ctx, o)
 	if err != nil {
 		return err
 	}
+	if err := preflightActivation(o.binDir, name); err != nil {
+		return err
+	}
+	active := inspectActivation(o.root, o.binDir, name)
+	evaluation := evaluateStatus(o, target, active)
+	if o.version == "" {
+		switch evaluation.Status {
+		case statusCurrent:
+			return writeReport(out, o.json, operationReport{Action: "update", ActivationName: name, Version: target.Release.TagName}, fmt.Sprintf("Pi %s is already current", target.Release.TagName))
+		case statusAhead:
+			return writeReport(out, o.json, operationReport{Action: "update", ActivationName: name, Version: activeVersion(active)}, fmt.Sprintf("Pi %s is newer than latest %s; no update performed", activeVersion(active), target.Release.TagName))
+		case statusCorrupt:
+			if active.LegacyVersion == "" || compareVersions(active.LegacyVersion, target.Release.TagName) > 0 {
+				return fmt.Errorf("%s activation is %s; rerun with --version %s to authorize repair or downgrade", name, evaluation.Reason, target.Release.TagName)
+			}
+		}
+	}
 	if o.dryRun {
-		name := activationName(o)
 		if err := preflightActivation(o.binDir, name); err != nil {
 			return err
 		}
-		return writeReport(out, o.json, operationReport{Action: "update", ActivationName: name, Version: r.TagName, DryRun: true}, fmt.Sprintf("Would install Pi %s (%s) and activate it as %s", r.TagName, binary.Name, name))
+		return writeReport(out, o.json, operationReport{Action: "update", ActivationName: name, Version: target.Release.TagName, DryRun: true}, fmt.Sprintf("Would install Pi %s (%s) and activate it as %s", target.Release.TagName, target.Binary.Name, name))
 	}
-	return install(ctx, o, r.TagName, binary, checksums, out)
+	return install(ctx, o, target, out)
 }
 
 func showStatus(ctx context.Context, o options, out io.Writer) error {
-	r, _, _, err := resolveRelease(ctx, o)
+	target, err := resolveTarget(ctx, o)
 	if err != nil {
 		return err
 	}
 	name := activationName(o)
-	activeVersion, activePath := activeInstallation(o.root, o.binDir, name)
-	installed, err := installedVersions(o.root)
+	active := inspectActivation(o.root, o.binDir, name)
+	installed, err := installedVersions(o)
 	if err != nil {
 		return err
 	}
+	evaluation := evaluateStatus(o, target, active)
 	report := statusReport{
 		ActivationName: name,
-		ActiveVersion:  activeVersion, ActivePath: activePath, Installed: installed,
-		LatestVersion: r.TagName, UpToDate: activeVersion == r.TagName,
-		UpdateAvailable: activeVersion != r.TagName,
+		ActiveVersion:  activeVersion(active), ActivePath: active.Target, Installed: installed,
+		LatestVersion: target.Release.TagName, Status: evaluation.Status, Reason: evaluation.Reason,
+		UpToDate: evaluation.Status == statusCurrent, UpdateAvailable: evaluation.Status == statusBehind,
 	}
-	text := fmt.Sprintf("activation: %s\nactive: %s\nlatest: %s\nstatus: ", name, displayVersion(activeVersion), r.TagName)
-	if report.UpToDate {
-		text += "up to date"
-	} else {
-		text += "update available"
+	text := fmt.Sprintf("activation: %s\nactive: %s\nlatest: %s\nstatus: %s", name, displayVersion(report.ActiveVersion), target.Release.TagName, evaluation.Status)
+	if evaluation.Reason != "" {
+		text += " (" + evaluation.Reason + ")"
 	}
 	if err := writeReport(out, o.json, report, text); err != nil {
 		return err
 	}
-	if report.UpdateAvailable {
-		return &cliExitError{code: 2}
+	switch evaluation.Status {
+	case statusBehind:
+		return &cliExitError{code: 2, silent: true}
+	case statusNotInstalled, statusCorrupt:
+		return &cliExitError{code: 1, silent: true}
 	}
 	return nil
 }
 
 func useVersion(o options, version string, out io.Writer) error {
+	if o.goos != runtime.GOOS || o.goarch != runtime.GOARCH {
+		return fmt.Errorf("refusing to activate target %s/%s from updater running on %s/%s", o.goos, o.goarch, runtime.GOOS, runtime.GOARCH)
+	}
 	if !safeVersion(version) {
 		return fmt.Errorf("unsafe version %q", version)
 	}
-	path, ok := installedBinary(o.root, version)
-	if !ok {
+	installations, err := installationsForVersion(o, version)
+	if err != nil {
+		return err
+	}
+	if len(installations) == 0 {
 		return fmt.Errorf("Pi %s is not installed or is incomplete", version)
 	}
+	if len(installations) > 1 {
+		return fmt.Errorf("Pi %s has multiple verified builds installed; run update --version %s to select the published build", version, version)
+	}
+	path := installations[0].BinaryPath
 	name := activationName(o)
 	if o.dryRun {
 		if err := preflightActivation(o.binDir, name); err != nil {
@@ -272,36 +368,55 @@ func useVersion(o options, version string, out io.Writer) error {
 }
 
 func pruneVersions(o options, out io.Writer) error {
-	versions, err := installedVersions(o.root)
+	versions, err := installedVersions(o)
 	if err != nil {
 		return err
 	}
-	keep := map[string]bool{}
+	installations, err := scopedInstallations(o)
+	if err != nil {
+		return err
+	}
+	retainedVersions := map[string]bool{}
+	protectedDirectories := map[string]bool{}
+	protectedVersions := map[string]bool{}
 	protected := make([]string, 0, 2)
 	for _, name := range []string{"pi-bun", "pi"} {
-		active, _ := activeInstallation(o.root, o.binDir, name)
-		if active == "" {
+		active := inspectActivation(o.root, o.binDir, name)
+		if active.Installation == nil {
 			continue
 		}
-		keep[active] = true
-		protected = append(protected, name+"="+active)
+		version := active.Installation.Manifest.Tag
+		if installationMatchesOptions(*active.Installation, o) {
+			protectedDirectories[active.Installation.Directory] = true
+			protectedVersions[version] = true
+		}
+		protected = append(protected, name+"="+version)
 	}
 	for i, version := range versions {
 		if i >= o.keep {
 			break
 		}
-		keep[version] = true
+		retainedVersions[version] = true
 	}
+	removedSet := map[string]bool{}
 	var removed []string
-	for _, version := range versions {
-		if keep[version] {
+	for _, inst := range installations {
+		if retainedVersions[inst.Manifest.Tag] || protectedDirectories[inst.Directory] {
 			continue
 		}
-		removed = append(removed, version)
+		label := inst.Manifest.Tag
+		if protectedVersions[inst.Manifest.Tag] {
+			label += "@" + inst.Manifest.ArchiveSHA256[:12]
+		}
+		if !removedSet[label] {
+			removedSet[label] = true
+			removed = append(removed, label)
+		}
 		if !o.dryRun {
-			if err := os.RemoveAll(filepath.Join(o.root, "versions", version)); err != nil {
+			if err := os.RemoveAll(inst.Directory); err != nil {
 				return err
 			}
+			_ = os.Remove(filepath.Dir(inst.Directory))
 		}
 	}
 	report := operationReport{
@@ -348,6 +463,18 @@ func resolveRelease(ctx context.Context, o options) (release, asset, asset, erro
 	return r, binary, checksums, nil
 }
 
+func resolveTarget(ctx context.Context, o options) (releaseTarget, error) {
+	r, binary, checksums, err := resolveRelease(ctx, o)
+	if err != nil {
+		return releaseTarget{}, err
+	}
+	digest, err := fetchChecksum(ctx, checksums.URL, binary.Name)
+	if err != nil {
+		return releaseTarget{}, fmt.Errorf("fetch checksum for %s: %w", binary.Name, err)
+	}
+	return releaseTarget{Release: r, Binary: binary, Checksums: checksums, ArchiveSHA256: digest}, nil
+}
+
 func writeReport(out io.Writer, asJSON bool, report any, text string) error {
 	if asJSON {
 		return json.NewEncoder(out).Encode(report)
@@ -375,11 +502,8 @@ func assetName(goos, goarch string) (string, error) {
 }
 
 func validateRepo(repo string) error {
-	parts := strings.Split(repo, "/")
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" || strings.ContainsAny(repo, "\\?&#") {
-		return fmt.Errorf("repo must be an owner/repository pair, got %q", repo)
-	}
-	return nil
+	_, err := canonicalRepository(repo)
+	return err
 }
 
 type semVersion struct {
@@ -447,6 +571,9 @@ func fetchRelease(ctx context.Context, repo, version string) (release, error) {
 	if err := getJSON(ctx, endpoint, &r); err != nil {
 		return release{}, err
 	}
+	if version != "" && r.TagName != version {
+		return release{}, fmt.Errorf("release endpoint returned tag %q for requested tag %q", r.TagName, version)
+	}
 	return r, nil
 }
 
@@ -467,6 +594,29 @@ func getJSON(ctx context.Context, url string, dst any) error {
 	return json.NewDecoder(io.LimitReader(resp.Body, 10<<20)).Decode(dst)
 }
 
+func fetchChecksum(ctx context.Context, url, assetName string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("GET %s: %s", url, resp.Status)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxChecksumBytes+1))
+	if err != nil {
+		return "", err
+	}
+	if len(data) > maxChecksumBytes {
+		return "", fmt.Errorf("checksum manifest exceeds %d bytes", maxChecksumBytes)
+	}
+	return parseChecksum(string(data), assetName)
+}
+
 func findAsset(assets []asset, name string) (asset, bool) {
 	for _, a := range assets {
 		if a.Name == name && a.URL != "" {
@@ -476,49 +626,43 @@ func findAsset(assets []asset, name string) (asset, bool) {
 	return asset{}, false
 }
 
-func install(ctx context.Context, o options, tag string, binary, checksums asset, out io.Writer) error {
+func install(ctx context.Context, o options, target releaseTarget, out io.Writer) error {
 	if o.goos != runtime.GOOS || o.goarch != runtime.GOARCH {
 		return fmt.Errorf("refusing to activate target %s/%s from updater running on %s/%s", o.goos, o.goarch, runtime.GOOS, runtime.GOARCH)
 	}
-	if err := ensureStoreLayout(o.root); err != nil {
+	tag := target.Release.TagName
+	if err := ensureTagLayout(o, tag); err != nil {
 		return err
 	}
 	linkName := activationName(o)
-	finalDir := filepath.Join(o.root, "versions", tag)
-	binaryPath, alreadyInstalled := installedBinary(o.root, tag)
-	if alreadyInstalled {
-		if err := activate(o.binDir, linkName, binaryPath); err != nil {
+	installed, exists, loadErr := exactInstallation(o, tag, target.ArchiveSHA256)
+	if exists && loadErr == nil {
+		if err := activate(o.binDir, linkName, installed.BinaryPath); err != nil {
 			return err
 		}
 		return writeReport(out, o.json, operationReport{Action: "update", ActivationName: linkName, Version: tag}, fmt.Sprintf("Pi %s is already installed; activated %s", tag, filepath.Join(o.binDir, linkName)))
-	}
-	if err := os.MkdirAll(filepath.Join(o.root, "versions"), 0o755); err != nil {
-		return err
 	}
 	tmp, err := os.MkdirTemp(o.root, ".pi-bun-download-")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(tmp)
-	checksumFile, archiveFile := filepath.Join(tmp, "SHA256SUMS"), filepath.Join(tmp, binary.Name)
-	if err := download(ctx, checksums.URL, checksumFile); err != nil {
-		return fmt.Errorf("download checksums: %w", err)
+	archiveFile := filepath.Join(tmp, target.Binary.Name)
+	if err := download(ctx, target.Binary.URL, archiveFile); err != nil {
+		return fmt.Errorf("download %s: %w", target.Binary.Name, err)
 	}
-	expected, err := parseChecksumFile(checksumFile, binary.Name)
+	if err := verifySHA256(archiveFile, target.ArchiveSHA256); err != nil {
+		return err
+	}
+	stage, err := os.MkdirTemp(tagDirectory(o, tag), "."+target.ArchiveSHA256+".staging-")
 	if err != nil {
 		return err
 	}
-	if err := download(ctx, binary.URL, archiveFile); err != nil {
-		return fmt.Errorf("download %s: %w", binary.Name, err)
-	}
-	if err := verifySHA256(archiveFile, expected); err != nil {
-		return err
-	}
-	stage, err := os.MkdirTemp(filepath.Join(o.root, "versions"), "."+tag+".staging-")
-	if err != nil {
-		return err
-	}
-	defer os.RemoveAll(stage)
+	defer func() {
+		if stage != "" {
+			_ = os.RemoveAll(stage)
+		}
+	}()
 	if err := extractTarGz(archiveFile, stage); err != nil {
 		return err
 	}
@@ -526,88 +670,48 @@ func install(ctx context.Context, o options, tag string, binary, checksums asset
 	if !isRegularExecutable(stagedBinary) {
 		return fmt.Errorf("archive does not contain a regular pi/pi executable")
 	}
-	if err := os.Rename(stage, finalDir); err != nil && !errors.Is(err, os.ErrExist) {
-		return fmt.Errorf("activate version directory: %w", err)
-	}
-	binaryPath, alreadyInstalled = installedBinary(o.root, tag)
-	if !alreadyInstalled {
-		return fmt.Errorf("installed version %s is incomplete", tag)
-	}
-	if err := activate(o.binDir, linkName, binaryPath); err != nil {
-		return err
-	}
-	return writeReport(out, o.json, operationReport{Action: "update", ActivationName: linkName, Version: tag}, fmt.Sprintf("Installed Pi %s (%s)\nActivated %s", tag, binary.Name, filepath.Join(o.binDir, linkName)))
-}
-
-func isRegularExecutable(path string) bool {
-	info, err := os.Lstat(path)
-	return err == nil && info.Mode().IsRegular() && info.Mode()&0o111 != 0
-}
-
-func isDirectoryNoSymlink(path string) bool {
-	info, err := os.Lstat(path)
-	return err == nil && info.IsDir() && info.Mode()&os.ModeSymlink == 0
-}
-
-func ensureStoreLayout(root string) error {
-	if err := os.MkdirAll(root, 0o755); err != nil {
-		return err
-	}
-	if !isDirectoryNoSymlink(root) {
-		return fmt.Errorf("refusing symlinked or invalid store root %s", root)
-	}
-	versions := filepath.Join(root, "versions")
-	if err := os.MkdirAll(versions, 0o755); err != nil {
-		return err
-	}
-	if !isDirectoryNoSymlink(versions) {
-		return fmt.Errorf("refusing symlinked or invalid versions directory %s", versions)
-	}
-	return nil
-}
-
-func installedBinary(root, version string) (string, bool) {
-	if !safeVersion(version) || !isDirectoryNoSymlink(root) {
-		return "", false
-	}
-	versions := filepath.Join(root, "versions")
-	versionDir := filepath.Join(versions, version)
-	piDir := filepath.Join(versionDir, "pi")
-	binary := filepath.Join(piDir, "pi")
-	if !isDirectoryNoSymlink(versions) || !isDirectoryNoSymlink(versionDir) || !isDirectoryNoSymlink(piDir) || !isRegularExecutable(binary) {
-		return "", false
-	}
-	return binary, true
-}
-
-func installedVersions(root string) ([]string, error) {
-	if _, err := os.Lstat(root); errors.Is(err, os.ErrNotExist) {
-		return []string{}, nil
-	} else if err != nil || !isDirectoryNoSymlink(root) {
-		return nil, fmt.Errorf("refusing symlinked or invalid store root %s", root)
-	}
-	dir := filepath.Join(root, "versions")
-	entries, err := os.ReadDir(dir)
-	if errors.Is(err, os.ErrNotExist) {
-		return []string{}, nil
-	}
+	binarySHA256, err := sha256File(stagedBinary)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("hash extracted binary: %w", err)
 	}
-	if !isDirectoryNoSymlink(dir) {
-		return nil, fmt.Errorf("refusing symlinked or invalid versions directory %s", dir)
+	manifest := newManifest(o, tag, target.Binary, target.ArchiveSHA256, binarySHA256)
+	if err := writeManifest(stage, manifest); err != nil {
+		return fmt.Errorf("write installation manifest: %w", err)
 	}
-	versions := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		if !entry.IsDir() || !safeVersion(entry.Name()) {
-			continue
+	finalDir := installDirectory(o, tag, target.ArchiveSHA256)
+	replaced, err := publishInstallation(stage, finalDir)
+	if err != nil {
+		return err
+	}
+	if !replaced {
+		stage = ""
+	}
+	installed, exists, err = exactInstallation(o, tag, target.ArchiveSHA256)
+	if err != nil || !exists {
+		validationErr := err
+		if validationErr == nil {
+			validationErr = fmt.Errorf("published installation is missing")
 		}
-		if _, ok := installedBinary(root, entry.Name()); ok {
-			versions = append(versions, entry.Name())
+		validationErr = fmt.Errorf("validate published installation: %w", validationErr)
+		if replaced {
+			if rollbackErr := exchangePaths(stage, finalDir); rollbackErr != nil {
+				preserved := stage
+				stage = ""
+				return errors.Join(validationErr, fmt.Errorf("rollback failed; previous installation preserved at %s: %w", preserved, rollbackErr))
+			}
 		}
+		return validationErr
 	}
-	sort.Slice(versions, func(i, j int) bool { return compareVersions(versions[i], versions[j]) > 0 })
-	return versions, nil
+	if replaced {
+		if err := os.RemoveAll(stage); err != nil {
+			return fmt.Errorf("remove replaced installation: %w", err)
+		}
+		stage = ""
+	}
+	if err := activate(o.binDir, linkName, installed.BinaryPath); err != nil {
+		return err
+	}
+	return writeReport(out, o.json, operationReport{Action: "update", ActivationName: linkName, Version: tag}, fmt.Sprintf("Installed Pi %s (%s)\nActivated %s", tag, target.Binary.Name, filepath.Join(o.binDir, linkName)))
 }
 
 func compareVersions(a, b string) int {
@@ -633,12 +737,16 @@ func compareVersions(a, b string) int {
 	for i := 0; i < len(aa.pre) && i < len(bb.pre); i++ {
 		an, bn := isNumeric(aa.pre[i]), isNumeric(bb.pre[i])
 		if an && bn {
-			av, _ := strconv.ParseUint(aa.pre[i], 10, 64)
-			bv, _ := strconv.ParseUint(bb.pre[i], 10, 64)
-			if av > bv {
+			if len(aa.pre[i]) > len(bb.pre[i]) {
 				return 1
 			}
-			if av < bv {
+			if len(aa.pre[i]) < len(bb.pre[i]) {
+				return -1
+			}
+			if aa.pre[i] > bb.pre[i] {
+				return 1
+			}
+			if aa.pre[i] < bb.pre[i] {
 				return -1
 			}
 			continue
@@ -663,32 +771,6 @@ func compareVersions(a, b string) int {
 		return -1
 	}
 	return 0
-}
-
-func activeInstallation(root, binDir, name string) (string, string) {
-	link := filepath.Join(binDir, name)
-	target, err := os.Readlink(link)
-	if err != nil {
-		return "", ""
-	}
-	if !filepath.IsAbs(target) {
-		target = filepath.Join(binDir, target)
-	}
-	target = filepath.Clean(target)
-	versionsRoot := filepath.Join(root, "versions")
-	rel, err := filepath.Rel(versionsRoot, target)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return "", ""
-	}
-	parts := strings.Split(rel, string(filepath.Separator))
-	if len(parts) != 3 || parts[1] != "pi" || parts[2] != "pi" || !safeVersion(parts[0]) {
-		return "", ""
-	}
-	binary, ok := installedBinary(root, parts[0])
-	if !ok || binary != target {
-		return "", ""
-	}
-	return parts[0], target
 }
 
 func acquireLock(root string) (func(), error) {
@@ -772,16 +854,10 @@ func parseChecksum(data, asset string) (string, error) {
 }
 
 func verifySHA256(path, expected string) error {
-	f, err := os.Open(path)
+	got, err := sha256File(path)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return err
-	}
-	got := hex.EncodeToString(h.Sum(nil))
 	if got != expected {
 		return fmt.Errorf("SHA-256 mismatch for %s: got %s, expected %s", filepath.Base(path), got, expected)
 	}
@@ -881,20 +957,163 @@ func preflightActivation(binDir, name string) error {
 	return nil
 }
 
+func recoverActivationSwaps(binDir, name string) error {
+	entries, err := os.ReadDir(binDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	prefix := "." + name + ".swap-"
+	link := filepath.Join(binDir, name)
+	matching := make([]string, 0)
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), prefix) {
+			matching = append(matching, filepath.Join(binDir, entry.Name()))
+		}
+	}
+	if len(matching) == 0 {
+		return nil
+	}
+	if _, err := os.Lstat(link); errors.Is(err, os.ErrNotExist) {
+		legacyCandidates := 0
+		for _, swapDir := range matching {
+			info, statErr := os.Lstat(swapDir)
+			if statErr != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+				continue
+			}
+			children, readErr := os.ReadDir(swapDir)
+			if readErr == nil && len(children) == 1 && children[0].Name() == "previous" {
+				legacyCandidates++
+			}
+		}
+		if legacyCandidates > 1 {
+			return fmt.Errorf("multiple legacy activation recovery candidates for %s; preserved under %s", link, binDir)
+		}
+	}
+	for _, swapDir := range matching {
+		info, err := os.Lstat(swapDir)
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing suspicious activation swap artifact %s", swapDir)
+		}
+		children, err := os.ReadDir(swapDir)
+		if err != nil {
+			return err
+		}
+		if len(children) == 0 {
+			if err := os.Remove(swapDir); err != nil {
+				return err
+			}
+			continue
+		}
+		if len(children) != 1 || (children[0].Name() != "next" && children[0].Name() != "previous") {
+			return fmt.Errorf("refusing suspicious activation swap contents in %s", swapDir)
+		}
+		artifact := filepath.Join(swapDir, children[0].Name())
+		artifactInfo, err := os.Lstat(artifact)
+		if err != nil {
+			return err
+		}
+		if children[0].Name() == "next" {
+			if artifactInfo.Mode()&os.ModeSymlink == 0 {
+				liveInfo, liveErr := os.Lstat(link)
+				if liveErr != nil || liveInfo.Mode()&os.ModeSymlink == 0 {
+					return fmt.Errorf("refusing suspicious activation swap artifact %s", artifact)
+				}
+				if err := exchangePaths(artifact, link); err != nil {
+					return fmt.Errorf("rollback interrupted activation exchange from %s: %w", artifact, err)
+				}
+				artifactInfo, err = os.Lstat(artifact)
+				if err != nil || artifactInfo.Mode()&os.ModeSymlink == 0 {
+					return fmt.Errorf("activation rollback left unexpected entry at %s", artifact)
+				}
+			}
+			if err := os.Remove(artifact); err != nil {
+				return err
+			}
+			if err := os.Remove(swapDir); err != nil {
+				return err
+			}
+			continue
+		}
+
+		liveInfo, liveErr := os.Lstat(link)
+		if errors.Is(liveErr, os.ErrNotExist) {
+			switch {
+			case artifactInfo.Mode()&os.ModeSymlink != 0:
+				oldTarget, err := os.Readlink(artifact)
+				if err != nil {
+					return err
+				}
+				if err := os.Symlink(oldTarget, link); err != nil {
+					return fmt.Errorf("restore previous activation: %w", err)
+				}
+			case artifactInfo.Mode().IsRegular():
+				if err := os.Link(artifact, link); err != nil {
+					return fmt.Errorf("restore preserved activation file: %w", err)
+				}
+			default:
+				return fmt.Errorf("refusing suspicious legacy activation artifact %s", artifact)
+			}
+			if err := os.Remove(artifact); err != nil {
+				return err
+			}
+			if err := os.Remove(swapDir); err != nil {
+				return err
+			}
+			continue
+		}
+		if liveErr != nil {
+			return liveErr
+		}
+		if liveInfo.Mode()&os.ModeSymlink != 0 && artifactInfo.Mode()&os.ModeSymlink != 0 {
+			if err := os.Remove(artifact); err != nil {
+				return err
+			}
+			if err := os.Remove(swapDir); err != nil {
+				return err
+			}
+			continue
+		}
+		if liveInfo.Mode().IsRegular() && artifactInfo.Mode().IsRegular() && os.SameFile(liveInfo, artifactInfo) {
+			if err := os.Remove(artifact); err != nil {
+				return err
+			}
+			if err := os.Remove(swapDir); err != nil {
+				return err
+			}
+			continue
+		}
+		return fmt.Errorf("legacy activation artifact requires manual recovery: %s", artifact)
+	}
+	return nil
+}
+
 func activate(binDir, name, target string) error {
+	return activateWithExchange(binDir, name, target, exchangePaths)
+}
+
+func activateWithExchange(binDir, name, target string, exchange func(string, string) error) (returnErr error) {
 	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		return err
+	}
+	if err := recoverActivationSwaps(binDir, name); err != nil {
 		return err
 	}
 	if err := preflightActivation(binDir, name); err != nil {
 		return err
 	}
 	link := filepath.Join(binDir, name)
-	if _, err := os.Lstat(link); errors.Is(err, os.ErrNotExist) {
-		if err := os.Symlink(target, link); err != nil {
-			return fmt.Errorf("create activation symlink: %w", err)
-		}
+	if err := os.Symlink(target, link); err == nil {
 		return nil
-	} else if err != nil {
+	} else if !errors.Is(err, os.ErrExist) {
+		return fmt.Errorf("create activation symlink: %w", err)
+	}
+	if err := preflightActivation(binDir, name); err != nil {
 		return err
 	}
 
@@ -902,34 +1121,60 @@ func activate(binDir, name, target string) error {
 	if err != nil {
 		return err
 	}
-	backup := filepath.Join(swapDir, "previous")
-	if err := os.Rename(link, backup); err != nil {
-		_ = os.Remove(swapDir)
-		return err
-	}
-	backupInfo, err := os.Lstat(backup)
-	if err != nil {
-		return fmt.Errorf("inspect moved activation target %s: %w", backup, err)
-	}
-	if backupInfo.Mode()&os.ModeSymlink == 0 {
-		if backupInfo.Mode().IsRegular() {
-			if restoreErr := os.Link(backup, link); restoreErr == nil {
-				_ = os.Remove(backup)
-				_ = os.Remove(swapDir)
-				return fmt.Errorf("refusing to replace non-symlink %s", link)
+	next := filepath.Join(swapDir, "next")
+	preserveSwap := false
+	defer func() {
+		if preserveSwap {
+			return
+		}
+		if next != "" {
+			if err := os.Remove(next); err != nil && !errors.Is(err, os.ErrNotExist) {
+				returnErr = errors.Join(returnErr, err)
 			}
 		}
-		return fmt.Errorf("activation target changed concurrently; preserved at %s", backup)
-	}
-	if err := os.Symlink(target, link); err != nil {
-		oldTarget, readErr := os.Readlink(backup)
-		if readErr == nil {
-			_ = os.Symlink(oldTarget, link)
+		if swapDir != "" {
+			if err := os.Remove(swapDir); err != nil && !errors.Is(err, os.ErrNotExist) {
+				returnErr = errors.Join(returnErr, err)
+			}
 		}
-		return fmt.Errorf("activation target changed concurrently; previous symlink preserved at %s: %w", backup, err)
+	}()
+	if err := os.Symlink(target, next); err != nil {
+		return fmt.Errorf("stage activation symlink: %w", err)
 	}
-	if err := os.Remove(backup); err != nil {
+	stagedTarget, err := os.Readlink(next)
+	if err != nil || stagedTarget != target {
+		return fmt.Errorf("verify staged activation symlink: target %q, error %v", stagedTarget, err)
+	}
+	if err := preflightActivation(binDir, name); err != nil {
 		return err
 	}
-	return os.Remove(swapDir)
+	if err := exchange(next, link); err != nil {
+		return fmt.Errorf("atomically exchange activation symlink: %w", err)
+	}
+	displaced, err := os.Lstat(next)
+	if err != nil {
+		preserveSwap = true
+		return fmt.Errorf("inspect displaced activation at %s: %w", next, err)
+	}
+	if displaced.Mode()&os.ModeSymlink == 0 {
+		if err := exchange(next, link); err != nil {
+			preserveSwap = true
+			return fmt.Errorf("activation target changed concurrently; rollback failed and displaced entry is preserved at %s: %w", next, err)
+		}
+		replacementTarget, readErr := os.Readlink(next)
+		if readErr != nil || replacementTarget != target {
+			preserveSwap = true
+			return fmt.Errorf("activation target changed concurrently during rollback; entry preserved at %s", next)
+		}
+		return fmt.Errorf("refusing to replace non-symlink %s", link)
+	}
+	if err := os.Remove(next); err != nil {
+		return err
+	}
+	next = ""
+	if err := os.Remove(swapDir); err != nil {
+		return err
+	}
+	swapDir = ""
+	return nil
 }

@@ -6,30 +6,34 @@ import (
 	"compress/gzip"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
 func TestInstalledBinaryRejectsSymlinkedPayload(t *testing.T) {
 	root := t.TempDir()
 	version := "v1.2.3"
-	piDir := filepath.Join(root, "versions", version, "pi")
-	if err := os.MkdirAll(piDir, 0o755); err != nil {
+	createInstalledVersion(t, root, version)
+	o := options{repo: defaultRepo, root: root, binDir: filepath.Join(root, "bin"), goos: runtime.GOOS, goarch: runtime.GOARCH}
+	installations, err := installationsForVersion(o, version)
+	if err != nil || len(installations) != 1 {
+		t.Fatalf("fixture installations = %v, %v", installations, err)
+	}
+	binary := installations[0].BinaryPath
+	if err := os.Remove(binary); err != nil {
 		t.Fatal(err)
 	}
 	external := filepath.Join(t.TempDir(), "outside")
 	if err := os.WriteFile(external, []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink(external, filepath.Join(piDir, "pi")); err != nil {
+	if err := os.Symlink(external, binary); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := installedBinary(root, version); ok {
-		t.Fatal("accepted a symlinked installed binary")
-	}
-	if versions, err := installedVersions(root); err != nil || len(versions) != 0 {
+	if versions, err := installedVersions(o); err != nil || len(versions) != 0 {
 		t.Fatalf("installedVersions = %v, %v", versions, err)
 	}
-	if err := useVersion(options{root: root, binDir: filepath.Join(root, "bin")}, version, &bytes.Buffer{}); err == nil {
+	if err := useVersion(o, version, &bytes.Buffer{}); err == nil {
 		t.Fatal("use accepted a symlinked installed binary")
 	}
 }
@@ -53,10 +57,15 @@ func TestUseNormalizesRelativeStoreAndBinPaths(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want, err := filepath.Abs(filepath.Join("store", "versions", "v1.2.3", "pi", "pi"))
+	root, err := filepath.Abs("store")
 	if err != nil {
 		t.Fatal(err)
 	}
+	installations, err := installationsForVersion(options{repo: defaultRepo, root: root, goos: runtime.GOOS, goarch: runtime.GOARCH}, "v1.2.3")
+	if err != nil || len(installations) != 1 {
+		t.Fatalf("fixture installations = %v, %v", installations, err)
+	}
+	want := installations[0].BinaryPath
 	if resolved != want {
 		t.Fatalf("resolved symlink = %q, want %q", resolved, want)
 	}
@@ -68,6 +77,9 @@ func TestSemVerOrderingAndValidation(t *testing.T) {
 	}
 	if compareVersions("v1.0.0-rc.2", "v1.0.0-rc.1") <= 0 {
 		t.Fatal("prerelease ordering is wrong")
+	}
+	if compareVersions("v1.0.0-184467440737095516160", "v1.0.0-184467440737095516159") <= 0 {
+		t.Fatal("large numeric prerelease ordering overflowed")
 	}
 	for _, version := range []string{"vdev", "v1.2", "v01.2.3", "v1.2.3-01", "v18446744073709551616.0.0"} {
 		if safeVersion(version) {

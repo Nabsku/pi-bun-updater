@@ -1,6 +1,6 @@
 # pi-bun
 
-A small, dependency-free Go updater for the **official compiled Bun build** of [Pi](https://pi.dev/).
+A small, standalone Go updater for the **official compiled Bun build** of [Pi](https://pi.dev/).
 
 By default it installs alongside the npm/pnpm Pi package and exposes the compiled binary as `pi-bun`; the updater remains `pi-bun-update`. Explicit `--force` mode instead activates the compiled binary as `pi` in the selected bin directory.
 
@@ -10,10 +10,14 @@ By default it installs alongside the npm/pnpm Pi package and exposes the compile
 - Selects the official asset for the running platform: macOS/Linux × arm64/amd64.
 - Downloads the release archive and upstream `SHA256SUMS`; verifies SHA-256 before extraction.
 - Rejects archive traversal, symlinks, and hardlinks.
-- Stores immutable releases in `~/.local/share/pi-bun/versions/<tag>/`.
-- Safely repoints `~/.local/bin/pi-bun` by default, or `~/.local/bin/pi` with explicit `--force`, only after extraction succeeds.
+- Stores each verified release by repository, OS, architecture, exact tag, and archive digest. A manifest records that provenance plus archive and extracted-binary hashes.
+- Revalidates the manifest and binary hash before reusing or activating an installation. Legacy tag-only installs are never trusted or adopted by name.
+- Atomically repoints `~/.local/bin/pi-bun` by default, or `~/.local/bin/pi` with explicit `--force`, only after extraction and manifest publication succeed.
 - Refuses to overwrite a non-symlink activation target; `--force` may replace an existing `pi` symlink but never a regular executable.
 - Takes a non-blocking per-store lock for `update`, `use`, and `prune`, preventing concurrent activation races.
+- Never replaces a valid newer activation with GitHub's older latest release. An explicit `--version` is required to authorize a downgrade, repair, or same-tag digest change.
+
+Atomic replacement uses the native Linux/macOS rename-exchange primitive. If the selected filesystem does not support it, replacement fails without falling back to a remove-then-create sequence.
 
 There is intentionally no silent background updating. Run `pi-bun-update` when you choose to update, or use `status` / `update --check` from an explicit scheduler policy.
 
@@ -43,7 +47,8 @@ Ensure `~/.local/bin` is on `PATH` when building from source.
 
 ```bash
 # Current active release vs latest compatible upstream release.
-# Exit: 0 = current, 2 = update available, 1 = error.
+# State: not_installed | current | behind | ahead | corrupt
+# Exit: 0 = current/ahead, 2 = behind, 1 = not_installed/corrupt/error.
 pi-bun-update status
 pi-bun-update status --json
 pi-bun-update update --check  # status alias for scripts
@@ -56,7 +61,7 @@ pi-bun-update update --dry-run
 # Switch instantly to a previously installed release; no download.
 pi-bun-update use v0.80.4
 
-# Keep the active release plus the N newest installed versions.
+# Keep active release identities plus the N newest installed version tags.
 pi-bun-update prune --keep 3
 pi-bun-update prune --keep 3 --dry-run
 ```
@@ -75,7 +80,9 @@ pi --version
 
 Use `--force` consistently for `update`, `status`, and `use`; those commands operate on the selected activation symlink. `prune` always protects versions referenced by both managed names (`pi-bun` and `pi`), regardless of the flag. This creates `pi` only in `--bin-dir` and does not uninstall the npm/pnpm Pi package. Your `PATH` order decides which `pi` command wins. A regular existing `pi` executable is never overwritten.
 
-All structured reports support `--json`. A `status` report includes `activation_name`, `active_version`, `latest_version`, `installed_versions`, `up_to_date`, and `update_available`.
+All structured reports support `--json`. A `status` report includes `status`, optional `reason`, `activation_name`, `active_version`, `latest_version`, `installed_versions`, `up_to_date`, and `update_available`. `update_available` is true only for `behind`.
+
+The v2 store lives below `~/.local/share/pi-bun/versions/v2/`. Existing `versions/<tag>/` installs remain untouched, but `use` and `prune` ignore them. A normal update replaces a legacy activation with a freshly downloaded and verified v2 install when its claimed tag is not newer than latest; otherwise pass an explicit `--version` to state the intended target.
 
 ## Releases
 
@@ -111,4 +118,4 @@ This writes four statically-linked updater binaries to `dist/`: Darwin/Linux × 
 -keep N                 retained newest versions for prune (default: 3)
 ```
 
-`--os` and `--arch` are intended for CI inspection/dry-runs. An actual installation must match the updater's own OS and architecture; activating a foreign executable is refused.
+`--os` and `--arch` are intended for CI inspection/dry-runs. An actual installation or `use` activation must match the updater's own OS and architecture; activating a foreign executable is refused.
