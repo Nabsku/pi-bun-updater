@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -187,6 +188,11 @@ func TestPurgeLegacyRequiresExplicitSelectionAndProtectsActivation(t *testing.T)
 	if _, err := os.Stat(legacy); err != nil {
 		t.Fatalf("active legacy install was removed: %v", err)
 	}
+	stdout.Reset()
+	stderr.Reset()
+	if err := run([]string{"purge", "--legacy", "--root", root, "--bin-dir", binDir}, &stdout, &stderr); exitCode(err) != 1 || !strings.HasPrefix(stdout.String(), "No entries purged\n") {
+		t.Fatalf("preserved-only text = %q, %v", stdout.String(), err)
+	}
 	if err := os.Remove(filepath.Join(binDir, "pi-bun")); err != nil {
 		t.Fatal(err)
 	}
@@ -196,6 +202,71 @@ func TestPurgeLegacyRequiresExplicitSelectionAndProtectsActivation(t *testing.T)
 	}
 	if _, err := os.Lstat(legacyDirectory); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("legacy directory remains: %v", err)
+	}
+}
+
+func TestPurgeProtectsLegacyInstallThroughIntermediateAlias(t *testing.T) {
+	root, binDir := t.TempDir(), t.TempDir()
+	legacy := createExactLegacyInstall(t, root, "v1.2.3")
+	legacyDirectory := filepath.Dir(filepath.Dir(legacy))
+	alias := filepath.Join(root, "versions", "current")
+	if err := os.Symlink("v1.2.3", alias); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(alias, "pi", "pi"), filepath.Join(binDir, "pi-bun")); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := runPurgeJSON([]string{"purge", "--legacy", "--json", "--root", root, "--bin-dir", binDir})
+	if exitCode(err) != 1 || len(report.Removed) != 0 || len(report.Preserved) != 1 || report.Preserved[0].Path != legacyDirectory {
+		t.Fatalf("aliased activation purge = %+v, %v", report, err)
+	}
+	if _, err := os.Stat(legacy); err != nil {
+		t.Fatalf("aliased active installation was removed: %v", err)
+	}
+}
+
+func TestPurgeProtectsActivationEntryInsideOrphan(t *testing.T) {
+	root := t.TempDir()
+	o := options{repo: defaultRepo, root: root, goos: runtime.GOOS, goarch: runtime.GOARCH}
+	digest := sha256.Sum256([]byte("archive"))
+	inst := createInstalledVersionWithOptions(t, o, "v1.2.3", hex.EncodeToString(digest[:]), []byte("#!/bin/sh\n"))
+	orphan := filepath.Join(root, ".pi-bun-download-orphan")
+	binDir := filepath.Join(orphan, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(orphan, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	activation := filepath.Join(binDir, "pi-bun")
+	if err := os.Symlink(inst.BinaryPath, activation); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := runPurgeJSON([]string{"purge", "--orphans", "--json", "--root", root, "--bin-dir", binDir})
+	if exitCode(err) != 1 || len(report.Removed) != 0 || len(report.Preserved) != 1 || report.Preserved[0].Path != orphan {
+		t.Fatalf("nested activation purge = %+v, %v", report, err)
+	}
+	if target, err := os.Readlink(activation); err != nil || target != inst.BinaryPath {
+		t.Fatalf("nested activation was removed: %q, %v", target, err)
+	}
+}
+
+func TestPurgeFailsClosedForUnresolvedActivation(t *testing.T) {
+	root, binDir := t.TempDir(), t.TempDir()
+	legacy := createExactLegacyInstall(t, root, "v1.2.3")
+	legacyDirectory := filepath.Dir(filepath.Dir(legacy))
+	if err := os.Symlink(filepath.Join(root, "missing-target"), filepath.Join(binDir, "pi-bun")); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := runPurgeJSON([]string{"purge", "--legacy", "--json", "--root", root, "--bin-dir", binDir})
+	if exitCode(err) != 1 || len(report.Removed) != 0 || len(report.Preserved) != 1 || report.Preserved[0].Path != legacyDirectory || !strings.Contains(report.Preserved[0].Detail, "protection could not be established") {
+		t.Fatalf("unresolved activation purge = %+v, %v", report, err)
+	}
+	if _, err := os.Stat(legacy); err != nil {
+		t.Fatalf("unresolved activation allowed deletion: %v", err)
 	}
 }
 

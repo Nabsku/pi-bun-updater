@@ -322,12 +322,7 @@ func inspectActivationSwapArtifacts(binDir, name string) []doctorFinding {
 
 func purgeStore(o options, out io.Writer) error {
 	findings := inspectDoctor(o)
-	activeTargets := make([]string, 0, 2)
-	for _, name := range []string{"pi-bun", "pi"} {
-		if target := inspectActivation(o.root, o.binDir, name).Target; target != "" {
-			activeTargets = append(activeTargets, target)
-		}
-	}
+	protectedPaths, protectionErr := purgeProtectedPaths(o)
 	var removed []string
 	var preserved []doctorFinding
 	for _, finding := range findings {
@@ -335,7 +330,7 @@ func purgeStore(o options, out io.Writer) error {
 		if !selected {
 			continue
 		}
-		if reason := purgeSafetyFailure(o, finding, activeTargets); reason != "" {
+		if reason := purgeSafetyFailure(o, finding, protectedPaths, protectionErr); reason != "" {
 			preserved = append(preserved, doctorFinding{Code: "purge_preserved", Severity: doctorError, Path: finding.Path, Detail: reason})
 			continue
 		}
@@ -357,6 +352,11 @@ func purgeStore(o options, out io.Writer) error {
 			verb = "Would purge"
 		}
 		text = verb + ": " + strings.Join(removed, ", ")
+	} else if len(preserved) > 0 {
+		text = "No entries purged"
+		if o.dryRun {
+			text = "No entries would be purged"
+		}
 	}
 	if len(preserved) > 0 {
 		text += fmt.Sprintf("\nPreserved %d entries requiring attention", len(preserved))
@@ -370,10 +370,40 @@ func purgeStore(o options, out io.Writer) error {
 	return nil
 }
 
-func purgeSafetyFailure(o options, finding doctorFinding, activeTargets []string) string {
-	for _, target := range activeTargets {
-		if pathContains(finding.Path, target) {
-			return "entry contains an active activation target"
+func purgeProtectedPaths(o options) ([]string, error) {
+	protected := make([]string, 0, 4)
+	for _, name := range []string{"pi-bun", "pi"} {
+		link := filepath.Join(o.binDir, name)
+		if _, err := os.Lstat(link); errors.Is(err, os.ErrNotExist) {
+			continue
+		} else if err != nil {
+			return nil, fmt.Errorf("inspect activation %s: %w", link, err)
+		}
+		resolvedParent, err := filepath.EvalSymlinks(filepath.Dir(link))
+		if err != nil {
+			return nil, fmt.Errorf("resolve activation location %s: %w", link, err)
+		}
+		protected = append(protected, filepath.Join(resolvedParent, filepath.Base(link)))
+		resolvedTarget, err := filepath.EvalSymlinks(link)
+		if err != nil {
+			return nil, fmt.Errorf("resolve activation target %s: %w", link, err)
+		}
+		protected = append(protected, filepath.Clean(resolvedTarget))
+	}
+	return protected, nil
+}
+
+func purgeSafetyFailure(o options, finding doctorFinding, protectedPaths []string, protectionErr error) string {
+	if protectionErr != nil {
+		return "active installation protection could not be established: " + protectionErr.Error()
+	}
+	resolvedCandidate, err := filepath.EvalSymlinks(finding.Path)
+	if err != nil {
+		return "purge candidate could not be resolved: " + err.Error()
+	}
+	for _, protected := range protectedPaths {
+		if pathContains(resolvedCandidate, protected) {
+			return "entry contains an active activation path"
 		}
 	}
 	switch finding.Code {
