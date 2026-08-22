@@ -253,6 +253,38 @@ func TestPurgeProtectsActivationEntryInsideOrphan(t *testing.T) {
 	}
 }
 
+func TestPurgeProtectsIntermediateActivationSymlinkInsideOrphan(t *testing.T) {
+	root, binDir := t.TempDir(), t.TempDir()
+	o := options{repo: defaultRepo, root: root, binDir: binDir, goos: runtime.GOOS, goarch: runtime.GOARCH}
+	digest := sha256.Sum256([]byte("archive"))
+	inst := createInstalledVersionWithOptions(t, o, "v1.2.3", hex.EncodeToString(digest[:]), []byte("#!/bin/sh\n"))
+	orphan := filepath.Join(root, ".pi-bun-download-orphan")
+	if err := os.Mkdir(orphan, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	intermediate := filepath.Join(orphan, "target")
+	relativeTarget, err := filepath.Rel(orphan, inst.BinaryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(relativeTarget, intermediate); err != nil {
+		t.Fatal(err)
+	}
+	activation := filepath.Join(binDir, "pi-bun")
+	if err := os.Symlink(intermediate, activation); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := runPurgeJSON([]string{"purge", "--orphans", "--json", "--root", root, "--bin-dir", binDir})
+	if exitCode(err) != 1 || len(report.Removed) != 0 || len(report.Preserved) != 1 || report.Preserved[0].Path != orphan {
+		t.Fatalf("intermediate activation purge = %+v, %v", report, err)
+	}
+	resolved, resolveErr := filepath.EvalSymlinks(activation)
+	if resolveErr != nil || resolved != inst.BinaryPath {
+		t.Fatalf("activation chain was broken: %q, %v", resolved, resolveErr)
+	}
+}
+
 func TestPurgeFailsClosedForUnresolvedActivation(t *testing.T) {
 	root, binDir := t.TempDir(), t.TempDir()
 	legacy := createExactLegacyInstall(t, root, "v1.2.3")

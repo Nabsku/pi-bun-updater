@@ -6,8 +6,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
+	"syscall"
 )
 
 const (
@@ -371,7 +373,7 @@ func purgeStore(o options, out io.Writer) error {
 }
 
 func purgeProtectedPaths(o options) ([]string, error) {
-	protected := make([]string, 0, 4)
+	var protected []string
 	for _, name := range []string{"pi-bun", "pi"} {
 		link := filepath.Join(o.binDir, name)
 		if _, err := os.Lstat(link); errors.Is(err, os.ErrNotExist) {
@@ -379,18 +381,123 @@ func purgeProtectedPaths(o options) ([]string, error) {
 		} else if err != nil {
 			return nil, fmt.Errorf("inspect activation %s: %w", link, err)
 		}
-		resolvedParent, err := filepath.EvalSymlinks(filepath.Dir(link))
+		traversed, err := traceResolvedPath(link)
 		if err != nil {
-			return nil, fmt.Errorf("resolve activation location %s: %w", link, err)
+			return nil, fmt.Errorf("resolve activation %s: %w", link, err)
 		}
-		protected = append(protected, filepath.Join(resolvedParent, filepath.Base(link)))
-		resolvedTarget, err := filepath.EvalSymlinks(link)
-		if err != nil {
-			return nil, fmt.Errorf("resolve activation target %s: %w", link, err)
-		}
-		protected = append(protected, filepath.Clean(resolvedTarget))
+		protected = append(protected, traversed...)
 	}
 	return protected, nil
+}
+
+// traceResolvedPath follows path with EvalSymlinks semantics while retaining
+// every filesystem entry whose removal would break the resolution chain.
+func traceResolvedPath(path string) ([]string, error) {
+	volumeLength := len(filepath.VolumeName(path))
+	if volumeLength < len(path) && os.IsPathSeparator(path[volumeLength]) {
+		volumeLength++
+	}
+	volume := path[:volumeLength]
+	destination := volume
+	separator := string(os.PathSeparator)
+	linksWalked := 0
+	var traversed []string
+
+	for start, end := volumeLength, volumeLength; start < len(path); start = end {
+		for start < len(path) && os.IsPathSeparator(path[start]) {
+			start++
+		}
+		end = start
+		for end < len(path) && !os.IsPathSeparator(path[end]) {
+			end++
+		}
+
+		windowsDot := runtime.GOOS == "windows" && path[len(filepath.VolumeName(path)):] == "."
+		if end == start {
+			break
+		}
+		component := path[start:end]
+		if component == "." && !windowsDot {
+			continue
+		}
+		if component == ".." {
+			lastSeparator := len(destination) - 1
+			for ; lastSeparator >= volumeLength; lastSeparator-- {
+				if os.IsPathSeparator(destination[lastSeparator]) {
+					break
+				}
+			}
+			if lastSeparator < volumeLength || destination[lastSeparator+1:] == ".." {
+				if len(destination) > volumeLength {
+					destination += separator
+				}
+				destination += ".."
+			} else {
+				destination = destination[:lastSeparator]
+			}
+			continue
+		}
+
+		if len(destination) > len(filepath.VolumeName(destination)) && !os.IsPathSeparator(destination[len(destination)-1]) {
+			destination += separator
+		}
+		destination += component
+
+		info, err := os.Lstat(destination)
+		if err != nil {
+			return nil, err
+		}
+		traversed = append(traversed, filepath.Clean(destination))
+		if info.Mode()&os.ModeSymlink == 0 {
+			if !info.IsDir() && end < len(path) {
+				return nil, syscall.ENOTDIR
+			}
+			continue
+		}
+
+		linksWalked++
+		if linksWalked > 255 {
+			return nil, errors.New("too many symlinks")
+		}
+		target, err := os.Readlink(destination)
+		if err != nil {
+			return nil, err
+		}
+		if windowsDot && !filepath.IsAbs(target) {
+			break
+		}
+
+		path = target + path[end:]
+		targetVolumeLength := len(filepath.VolumeName(target))
+		if targetVolumeLength > 0 {
+			if targetVolumeLength < len(target) && os.IsPathSeparator(target[targetVolumeLength]) {
+				targetVolumeLength++
+			}
+			volume = target[:targetVolumeLength]
+			destination = volume
+			end = len(volume)
+		} else if len(target) > 0 && os.IsPathSeparator(target[0]) {
+			destination = target[:1]
+			end = 1
+			volume = target[:1]
+			volumeLength = 1
+		} else {
+			lastSeparator := len(destination) - 1
+			for ; lastSeparator >= volumeLength; lastSeparator-- {
+				if os.IsPathSeparator(destination[lastSeparator]) {
+					break
+				}
+			}
+			if lastSeparator < volumeLength {
+				destination = volume
+			} else {
+				destination = destination[:lastSeparator]
+			}
+			end = 0
+		}
+	}
+
+	return traversed, nil
 }
 
 func purgeSafetyFailure(o options, finding doctorFinding, protectedPaths []string, protectionErr error) string {
