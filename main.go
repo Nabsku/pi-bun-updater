@@ -54,6 +54,7 @@ type releaseTarget struct {
 type options struct {
 	repo, version, root, binDir, goos, goarch string
 	dryRun, check, json, force                bool
+	repair, legacy, orphans                   bool
 	keep                                      int
 }
 
@@ -110,7 +111,7 @@ func run(args []string, out, errOut io.Writer) error {
 	command := "update"
 	if len(args) > 0 {
 		switch args[0] {
-		case "update", "status", "use", "prune":
+		case "update", "status", "use", "prune", "doctor", "purge":
 			command, args = args[0], args[1:]
 		}
 	}
@@ -127,10 +128,13 @@ func run(args []string, out, errOut io.Writer) error {
 	fs.BoolVar(&o.check, "check", false, "show release status only (update command alias)")
 	fs.BoolVar(&o.json, "json", false, "emit a machine-readable JSON report")
 	fs.BoolVar(&o.force, "force", false, "activate as pi instead of pi-bun (may replace an existing pi symlink)")
+	fs.BoolVar(&o.repair, "repair", false, "repair recognized interrupted activation transactions (doctor only)")
+	fs.BoolVar(&o.legacy, "legacy", false, "remove recognized legacy tag-only installations (purge only)")
+	fs.BoolVar(&o.orphans, "orphans", false, "remove recognized inactive transaction artifacts (purge only)")
 	fs.IntVar(&o.keep, "keep", 3, "versions to retain during prune (active version is always retained)")
 	fs.Usage = func() {
-		fmt.Fprintln(errOut, "Usage: pi-bun-update [update|status|use|prune] [flags] [version]")
-		fmt.Fprintln(errOut, "Install, inspect, activate, and prune the official Pi Bun binary alongside Node/Pnpm Pi.")
+		fmt.Fprintln(errOut, "Usage: pi-bun-update [update|status|use|prune|doctor|purge] [flags] [version]")
+		fmt.Fprintln(errOut, "Install, inspect, activate, diagnose, and prune the official Pi Bun binary alongside Node/Pnpm Pi.")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -147,6 +151,12 @@ func run(args []string, out, errOut io.Writer) error {
 		return err
 	}
 	o.repo = repository
+	if o.repair && command != "doctor" {
+		return fmt.Errorf("--repair is a doctor-only flag")
+	}
+	if (o.legacy || o.orphans) && command != "purge" {
+		return fmt.Errorf("--legacy and --orphans are purge-only flags")
+	}
 	switch command {
 	case "status":
 		if fs.NArg() != 0 {
@@ -166,6 +176,28 @@ func run(args []string, out, errOut io.Writer) error {
 			return fmt.Errorf("keep must be non-negative")
 		}
 		return withLock(o.root, func() error { return pruneVersions(o, out) })
+	case "doctor":
+		if fs.NArg() != 0 {
+			return fmt.Errorf("doctor accepts no positional arguments")
+		}
+		if o.repair && o.dryRun {
+			return fmt.Errorf("--dry-run cannot be combined with doctor --repair; doctor without --repair is already read-only")
+		}
+		if o.repair {
+			return withLock(o.root, func() error { return doctorStore(o, out) })
+		}
+		return withExistingLock(o.root, func() error { return doctorStore(o, out) })
+	case "purge":
+		if fs.NArg() != 0 {
+			return fmt.Errorf("purge accepts no positional arguments")
+		}
+		if !o.legacy && !o.orphans {
+			return fmt.Errorf("purge requires --legacy, --orphans, or both")
+		}
+		if o.dryRun {
+			return withExistingLock(o.root, func() error { return purgeStore(o, out) })
+		}
+		return withLock(o.root, func() error { return purgeStore(o, out) })
 	case "update":
 		if fs.NArg() != 0 {
 			return fmt.Errorf("update accepts no positional arguments; use --version")
@@ -777,7 +809,8 @@ func acquireLock(root string) (func(), error) {
 	if err := ensureStoreLayout(root); err != nil {
 		return nil, err
 	}
-	file, err := os.OpenFile(filepath.Join(root, ".update.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	lockPath := filepath.Join(root, ".update.lock")
+	file, err := openUpdateLock(lockPath, true)
 	if err != nil {
 		return nil, err
 	}
@@ -798,6 +831,84 @@ func withLock(root string, fn func() error) error {
 	}
 	defer unlock()
 	return fn()
+}
+
+func withExistingLock(root string, fn func() error) error {
+	rootInfo, err := os.Lstat(root)
+	if errors.Is(err, os.ErrNotExist) || (err == nil && (!rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0)) {
+		return fn()
+	}
+	if err != nil {
+		return err
+	}
+	lockPath := filepath.Join(root, ".update.lock")
+	lockInfo, err := os.Lstat(lockPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return fn()
+	}
+	if err != nil {
+		return err
+	}
+	if !lockInfo.Mode().IsRegular() || lockInfo.Mode()&os.ModeSymlink != 0 {
+		return fn()
+	}
+	file, err := openUpdateLock(lockPath, false)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_SH|syscall.LOCK_NB); err != nil {
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return fmt.Errorf("another pi-bun update is already running")
+		}
+		return err
+	}
+	defer func() { _ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN) }()
+	return fn()
+}
+
+func openUpdateLock(path string, create bool) (*os.File, error) {
+	for attempt := 0; attempt < 3; attempt++ {
+		before, err := os.Lstat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			if !create {
+				return nil, err
+			}
+			file, openErr := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0o600)
+			if errors.Is(openErr, os.ErrExist) {
+				continue
+			}
+			if openErr != nil {
+				return nil, openErr
+			}
+			info, statErr := file.Stat()
+			if statErr != nil || !info.Mode().IsRegular() {
+				_ = file.Close()
+				return nil, fmt.Errorf("refusing symlinked or invalid update lock %s", path)
+			}
+			return file, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		if !before.Mode().IsRegular() || before.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("refusing symlinked or invalid update lock %s", path)
+		}
+		flags := os.O_RDONLY
+		if create {
+			flags = os.O_RDWR
+		}
+		file, err := os.OpenFile(path, flags|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+		if err != nil {
+			return nil, err
+		}
+		after, err := file.Stat()
+		if err == nil && after.Mode().IsRegular() && os.SameFile(before, after) {
+			return file, nil
+		}
+		_ = file.Close()
+	}
+	return nil, fmt.Errorf("update lock changed concurrently: %s", path)
 }
 
 func download(ctx context.Context, url, destination string) error {
