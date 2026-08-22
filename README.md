@@ -14,7 +14,7 @@ By default it installs alongside the npm/pnpm Pi package and exposes the compile
 - Revalidates the manifest and binary hash before reusing or activating an installation. Legacy tag-only installs are never trusted or adopted by name.
 - Atomically repoints `~/.local/bin/pi-bun` by default, or `~/.local/bin/pi` with explicit `--force`, only after extraction and manifest publication succeed.
 - Refuses to overwrite a non-symlink activation target; `--force` may replace an existing `pi` symlink but never a regular executable.
-- Takes a non-blocking per-store lock for `update`, `use`, and `prune`, preventing concurrent activation races.
+- Takes a non-blocking per-store lock for mutations, preventing concurrent activation and cleanup races.
 - Never replaces a valid newer activation with GitHub's older latest release. An explicit `--version` is required to authorize a downgrade, repair, or same-tag digest change.
 
 Atomic replacement uses the native Linux/macOS rename-exchange primitive. If the selected filesystem does not support it, replacement fails without falling back to a remove-then-create sequence.
@@ -64,6 +64,19 @@ pi-bun-update use v0.80.4
 # Keep active release identities plus the N newest installed version tags.
 pi-bun-update prune --keep 3
 pi-bun-update prune --keep 3 --dry-run
+
+# Validate the local store and both managed activations without network access.
+# Exit: 0 = healthy, 1 = one or more findings/error.
+pi-bun-update doctor
+pi-bun-update doctor --json
+
+# Recover only recognized interrupted activation transactions.
+pi-bun-update doctor --repair
+
+# Explicitly remove recognized inactive data. Neither class is deleted implicitly.
+pi-bun-update purge --legacy --dry-run
+pi-bun-update purge --legacy
+pi-bun-update purge --orphans
 ```
 
 ### Activate directly as `pi`
@@ -83,6 +96,8 @@ Use `--force` consistently for `update`, `status`, and `use`; those commands ope
 All structured reports support `--json`. A `status` report includes `status`, optional `reason`, `activation_name`, `active_version`, `latest_version`, `installed_versions`, `up_to_date`, and `update_available`. `update_available` is true only for `behind`.
 
 The v2 store lives below `~/.local/share/pi-bun/versions/v2/`. Existing `versions/<tag>/` installs remain untouched, but `use` and `prune` ignore them. A normal update replaces a legacy activation with a freshly downloaded and verified v2 install when its claimed tag is not newer than latest; otherwise pass an explicit `--version` to state the intended target.
+
+`doctor` is offline and read-only unless `--repair` is supplied. Repair is deliberately narrow: it invokes the same fail-closed recovery used before activation and does not delete corrupt installations. `purge` requires `--legacy`, `--orphans`, or both. It protects every activation target, removes only exact legacy layouts or private transaction directories, and preserves staging data unless a valid published replacement exists.
 
 ## Releases
 
@@ -112,10 +127,13 @@ This writes four statically-linked updater binaries to `dist/`: Darwin/Linux × 
 -root PATH              release store (default: ~/.local/share/pi-bun)
 -bin-dir PATH           activation directory (default: ~/.local/bin)
 -check                  status-only alias for update
--dry-run                preview update/use/prune mutations
+-dry-run                preview update/use/prune/purge mutations
 -json                   emit machine-readable reports
 -force                  activate as pi instead of pi-bun
 -keep N                 retained newest versions for prune (default: 3)
+-repair                 recover recognized activation transactions (doctor only)
+-legacy                 remove recognized tag-only installs (purge only)
+-orphans                remove recognized inactive workspaces (purge only)
 ```
 
 `--os` and `--arch` are intended for CI inspection/dry-runs. An actual installation or `use` activation must match the updater's own OS and architecture; activating a foreign executable is refused.

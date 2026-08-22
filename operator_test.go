@@ -93,17 +93,23 @@ func TestOperatorLifecycleAgainstReleaseFixture(t *testing.T) {
 	}
 }
 
-func TestMutationsFailWhileAnotherUpdaterHoldsTheLock(t *testing.T) {
+func TestStoreOperationsFailWhileAnotherUpdaterHoldsTheLock(t *testing.T) {
 	root := t.TempDir()
 	unlock, err := acquireLock(root)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer unlock()
-	var stdout, stderr bytes.Buffer
-	err = run([]string{"prune", "--root", root}, &stdout, &stderr)
-	if err == nil || !strings.Contains(err.Error(), "another pi-bun update") {
-		t.Fatalf("expected contention error, got %v", err)
+	for _, args := range [][]string{
+		{"prune", "--root", root},
+		{"doctor", "--root", root},
+		{"purge", "--legacy", "--dry-run", "--root", root},
+	} {
+		var stdout, stderr bytes.Buffer
+		err = run(args, &stdout, &stderr)
+		if err == nil || !strings.Contains(err.Error(), "another pi-bun update") {
+			t.Fatalf("run %v: expected contention error, got %v", args, err)
+		}
 	}
 }
 
