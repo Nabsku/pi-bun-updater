@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -23,10 +24,11 @@ func TestForceUseActivatesPiWithoutCreatingPiBun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want, err := filepath.EvalSymlinks(filepath.Join(root, "versions", "v1.2.3", "pi", "pi"))
-	if err != nil {
-		t.Fatal(err)
+	installations, err := installationsForVersion(options{repo: defaultRepo, root: root, goos: runtime.GOOS, goarch: runtime.GOARCH}, "v1.2.3")
+	if err != nil || len(installations) != 1 {
+		t.Fatalf("fixture installations = %v, %v", installations, err)
 	}
+	want := installations[0].BinaryPath
 	if resolved != want {
 		t.Fatalf("pi resolves to %q, want %q", resolved, want)
 	}
@@ -129,13 +131,15 @@ func TestPrunePreservesBothManagedActivations(t *testing.T) {
 			if report.ActivationName != wantName || len(report.ProtectedActivations) != 2 {
 				t.Fatalf("unexpected prune report: %+v", report)
 			}
+			o := options{repo: defaultRepo, root: root, goos: runtime.GOOS, goarch: runtime.GOARCH}
 			for _, version := range []string{"v1.2.3", "v1.2.4"} {
-				if _, err := os.Stat(filepath.Join(root, "versions", version)); err != nil {
-					t.Fatalf("managed active version %s was removed: %v", version, err)
+				installations, err := installationsForVersion(o, version)
+				if err != nil || len(installations) != 1 {
+					t.Fatalf("managed active version %s was removed: %v, %v", version, installations, err)
 				}
 			}
-			if _, err := os.Stat(filepath.Join(root, "versions", "v1.2.5")); !os.IsNotExist(err) {
-				t.Fatalf("inactive version survived prune: %v", err)
+			if installations, err := installationsForVersion(o, "v1.2.5"); err != nil || len(installations) != 0 {
+				t.Fatalf("inactive version survived prune: %v, %v", installations, err)
 			}
 		})
 	}

@@ -14,7 +14,6 @@ import (
 	"runtime"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestOperatorLifecycleAgainstReleaseFixture(t *testing.T) {
@@ -54,7 +53,7 @@ func TestOperatorLifecycleAgainstReleaseFixture(t *testing.T) {
 	if _, err := os.Lstat(filepath.Join(binDir, "pi-bun")); !os.IsNotExist(err) {
 		t.Fatalf("forced update created pi-bun: %v", err)
 	}
-	if got := runJSON(t, []string{"status", "--force", "--json", "--root", root, "--bin-dir", binDir}); !got.UpToDate || got.ActivationName != "pi" || got.ActiveVersion != "v9.9.9" {
+	if got := runJSON(t, []string{"status", "--force", "--json", "--root", root, "--bin-dir", binDir}); !got.UpToDate || got.Status != statusCurrent || got.ActivationName != "pi" || got.ActiveVersion != "v9.9.9" {
 		t.Fatalf("unexpected forced status: %+v", got)
 	}
 	blockedBin := t.TempDir()
@@ -68,7 +67,7 @@ func TestOperatorLifecycleAgainstReleaseFixture(t *testing.T) {
 	if err := run([]string{"update", "--root", root, "--bin-dir", binDir}, &stdout, &stderr); err != nil {
 		t.Fatalf("default update: %v; stderr=%s", err, stderr.String())
 	}
-	if got := runJSON(t, []string{"status", "--json", "--root", root, "--bin-dir", binDir}); !got.UpToDate || got.ActivationName != "pi-bun" || got.ActiveVersion != "v9.9.9" || got.LatestVersion != "v9.9.9" {
+	if got := runJSON(t, []string{"status", "--json", "--root", root, "--bin-dir", binDir}); !got.UpToDate || got.Status != statusCurrent || got.ActivationName != "pi-bun" || got.ActiveVersion != "v9.9.9" || got.LatestVersion != "v9.9.9" {
 		t.Fatalf("unexpected current status: %+v", got)
 	}
 
@@ -77,22 +76,20 @@ func TestOperatorLifecycleAgainstReleaseFixture(t *testing.T) {
 		t.Fatalf("use: %v", err)
 	}
 	status, err := runJSONWithError([]string{"status", "--json", "--root", root, "--bin-dir", binDir})
-	if exitCode(err) != 2 || status.UpToDate || status.ActiveVersion != "v9.9.8" || status.LatestVersion != "v9.9.9" {
+	if exitCode(err) != 2 || status.Status != statusBehind || !status.UpdateAvailable || status.UpToDate || status.ActiveVersion != "v9.9.8" || status.LatestVersion != "v9.9.9" {
 		t.Fatalf("expected update-available status and exit 2; status=%+v err=%v", status, err)
 	}
 
 	createInstalledVersion(t, root, "v9.9.7")
-	if err := os.Chtimes(filepath.Join(root, "versions", "v9.9.7"), time.Now().Add(-time.Hour), time.Now().Add(-time.Hour)); err != nil {
-		t.Fatal(err)
-	}
 	if err := run([]string{"prune", "--keep", "1", "--root", root, "--bin-dir", binDir}, &stdout, &stderr); err != nil {
 		t.Fatalf("prune: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(root, "versions", "v9.9.7")); !os.IsNotExist(err) {
-		t.Fatalf("old inactive version survived prune: %v", err)
+	o := options{repo: defaultRepo, root: root, goos: runtime.GOOS, goarch: runtime.GOARCH}
+	if installations, err := installationsForVersion(o, "v9.9.7"); err != nil || len(installations) != 0 {
+		t.Fatalf("old inactive version survived prune: %v, %v", installations, err)
 	}
-	if _, err := os.Stat(filepath.Join(root, "versions", "v9.9.8")); err != nil {
-		t.Fatalf("active version removed by prune: %v", err)
+	if installations, err := installationsForVersion(o, "v9.9.8"); err != nil || len(installations) != 1 {
+		t.Fatalf("active version removed by prune: %v, %v", installations, err)
 	}
 }
 
@@ -108,6 +105,35 @@ func TestMutationsFailWhileAnotherUpdaterHoldsTheLock(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "another pi-bun update") {
 		t.Fatalf("expected contention error, got %v", err)
 	}
+}
+
+func TestUpdateRecoversLegacyActivationBeforeReleaseLookupFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "upstream unavailable", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	useGitHubFixture(t, server.URL)
+
+	root, binDir := t.TempDir(), t.TempDir()
+	oldTarget := filepath.Join(root, "previous-pi")
+	swapDir := filepath.Join(binDir, ".pi-bun.swap-orphan")
+	if err := os.Mkdir(swapDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(oldTarget, filepath.Join(swapDir, "previous")); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	err := run([]string{"update", "--root", root, "--bin-dir", binDir}, &stdout, &stderr)
+	if err == nil {
+		t.Fatal("update unexpectedly succeeded while release lookup was unavailable")
+	}
+	got, readErr := os.Readlink(filepath.Join(binDir, "pi-bun"))
+	if readErr != nil || got != oldTarget {
+		t.Fatalf("release lookup failure left activation unrecovered: target=%q err=%v; update err=%v", got, readErr, err)
+	}
+	assertNoActivationSwaps(t, binDir, "pi-bun")
 }
 
 func fixtureArchive(t *testing.T) []byte {
@@ -133,13 +159,49 @@ func fixtureArchive(t *testing.T) []byte {
 
 func createInstalledVersion(t *testing.T, root, version string) {
 	t.Helper()
-	path := filepath.Join(root, "versions", version, "pi", "pi")
+	archiveSum := sha256.Sum256([]byte("archive:" + version))
+	createInstalledVersionWithOptions(t, options{
+		repo: defaultRepo, root: root, goos: runtime.GOOS, goarch: runtime.GOARCH,
+	}, version, hex.EncodeToString(archiveSum[:]), []byte("#!/bin/sh\n"))
+}
+
+func createInstalledVersionWithOptions(t *testing.T, o options, version, archiveSHA256 string, body []byte) installation {
+	t.Helper()
+	if o.repo == "" {
+		o.repo = defaultRepo
+	}
+	repository, err := canonicalRepository(o.repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	o.repo = repository
+	if o.goos == "" {
+		o.goos = runtime.GOOS
+	}
+	if o.goarch == "" {
+		o.goarch = runtime.GOARCH
+	}
+	assetFile, err := assetName(o.goos, o.goarch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(installDirectory(o, version, archiveSHA256), "pi", "pi")
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(path, []byte("#!/bin/sh\n"), 0o755); err != nil {
+	if err := os.WriteFile(path, body, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	binarySum := sha256.Sum256(body)
+	manifest := newManifest(o, version, asset{Name: assetFile}, archiveSHA256, hex.EncodeToString(binarySum[:]))
+	if err := writeManifest(filepath.Dir(filepath.Dir(path)), manifest); err != nil {
+		t.Fatal(err)
+	}
+	inst, err := loadInstallation(o.root, filepath.Dir(filepath.Dir(path)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return inst
 }
 
 func runJSON(t *testing.T, args []string) statusReport {
