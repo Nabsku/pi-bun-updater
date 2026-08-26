@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/Nabsku/pi-bun-updater/compare/v0.1.0...v0.1.1) (2026-08-26)
+
+
+### Bug Fixes
+
+* authenticate GitHub API requests ([c40f606](https://github.com/Nabsku/pi-bun-updater/commit/c40f6064fdde3d786ea150b87abd69ce9752ee2f))
+
 ## [0.1.0](https://github.com/Nabsku/pi-bun-updater/compare/v0.0.2...v0.1.0) (2026-08-26)
 
 
