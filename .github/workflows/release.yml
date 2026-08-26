@@ -1,9 +1,20 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing SemVer release tag to build
+        required: true
+        type: string
+      release_id:
+        description: GitHub Release ID created by Release Please
+        required: false
+        type: string
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -14,20 +25,114 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out the tagged source
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
 
+      - name: Validate release identity
+        id: validate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ inputs.release_id }}
+          TAG_NAME: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            printf 'Invalid release tag: %s\n' "$TAG_NAME" >&2
+            exit 1
+          fi
+
+          checked_out_sha="$(git rev-parse HEAD)"
+          tag_sha="$(git rev-parse "$TAG_NAME^{commit}")"
+          if [[ "$checked_out_sha" != "$tag_sha" ]]; then
+            printf 'Checked-out commit %s does not match tag %s at %s.\n' \
+              "$checked_out_sha" "$TAG_NAME" "$tag_sha" >&2
+            exit 1
+          fi
+
+          release_id="$RELEASE_ID"
+          if [[ -n "$release_id" && ! "$release_id" =~ ^[0-9]+$ ]]; then
+            printf 'Invalid GitHub Release ID: %s\n' "$release_id" >&2
+            exit 1
+          fi
+
+          release_json=""
+          for attempt in {1..6}; do
+            if [[ -n "$release_id" ]]; then
+              if release_json="$(gh api "repos/$GITHUB_REPOSITORY/releases/$release_id")"; then
+                :
+              else
+                release_json=""
+              fi
+            else
+              if release_json="$(gh api --paginate --slurp \
+                "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
+                jq -c --arg tag "$TAG_NAME" '
+                  (add // [])
+                  | map(select(.tag_name == $tag))
+                  | if length == 1 then .[0] else empty end'
+              )"; then
+                :
+              else
+                release_json=""
+              fi
+            fi
+
+            if [[ -n "$release_json" ]] && [[ "$(jq -r '.tag_name' <<<"$release_json")" == "$TAG_NAME" ]]; then
+              break
+            fi
+
+            if [[ "$attempt" -eq 6 ]]; then
+              printf 'Could not resolve GitHub Release %s after %s attempts.\n' "$TAG_NAME" "$attempt" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+
+          actual_release_id="$(jq -r '.id' <<<"$release_json")"
+          release_tag="$(jq -r '.tag_name' <<<"$release_json")"
+          release_draft="$(jq -r '.draft' <<<"$release_json")"
+          release_prerelease="$(jq -r '.prerelease' <<<"$release_json")"
+          if [[ ! "$actual_release_id" =~ ^[0-9]+$ || "$release_tag" != "$TAG_NAME" ]]; then
+            printf 'GitHub Release identity mismatch: id=%s tag=%s expected=%s\n' \
+              "$actual_release_id" "$release_tag" "$TAG_NAME" >&2
+            exit 1
+          fi
+          if [[ "$release_prerelease" != "false" ]]; then
+            printf 'Refusing to publish a prerelease through the stable release workflow.\n' >&2
+            exit 1
+          fi
+
+          release_state=published
+          if [[ "$release_draft" == "true" ]]; then
+            release_state=draft
+          fi
+          printf 'release_id=%s\nrelease_state=%s\n' "$actual_release_id" "$release_state" >> "$GITHUB_OUTPUT"
+          printf 'Validated %s at %s (release id %s, state %s).\n' \
+            "$TAG_NAME" "$checked_out_sha" "$actual_release_id" "$release_state"
+
       - name: Set up Go
-        uses: actions/setup-go@v6
+        if: ${{ steps.validate.outputs.release_state == 'draft' }}
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
 
-      - name: Build archives, checksums, and GitHub Release
-        uses: goreleaser/goreleaser-action@v7
+      - name: Build archives and publish the existing draft
+        if: ${{ steps.validate.outputs.release_state == 'draft' }}
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
         with:
           distribution: goreleaser
-          version: "~> v2"
+          version: v2.18.0
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Refuse to mutate a published release
+        if: ${{ steps.validate.outputs.release_state == 'published' }}
+        env:
+          TAG_NAME: ${{ inputs.tag }}
+        run: |
+          printf 'Release %s is already published; refusing an unscoped GoReleaser rerun.\n' "$TAG_NAME" >&2
+          exit 1
