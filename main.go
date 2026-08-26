@@ -610,18 +610,17 @@ func fetchRelease(ctx context.Context, repo, version string) (release, error) {
 }
 
 func getJSON(ctx context.Context, url string, dst any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := githubAPIRequest(ctx, http.MethodGet, url)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Accept", "application/vnd.github+json")
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("GET %s: %s", url, resp.Status)
+		return githubAPIError(url, resp)
 	}
 	return json.NewDecoder(io.LimitReader(resp.Body, 10<<20)).Decode(dst)
 }
@@ -934,6 +933,32 @@ func download(ctx context.Context, url, destination string) error {
 		return copyErr
 	}
 	return closeErr
+}
+
+func githubAPIRequest(ctx context.Context, method, url string) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, method, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	if token := githubAPIToken(); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	return req, nil
+}
+
+func githubAPIToken() string {
+	if token := os.Getenv("GH_TOKEN"); token != "" {
+		return token
+	}
+	return os.Getenv("GITHUB_TOKEN")
+}
+
+func githubAPIError(url string, resp *http.Response) error {
+	if resp.StatusCode == http.StatusForbidden && resp.Header.Get("X-RateLimit-Remaining") == "0" {
+		return fmt.Errorf("GET %s: %s: GitHub API rate limit exceeded; set GH_TOKEN or GITHUB_TOKEN", url, resp.Status)
+	}
+	return fmt.Errorf("GET %s: %s", url, resp.Status)
 }
 
 func parseChecksumFile(path, asset string) (string, error) {
