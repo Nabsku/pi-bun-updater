@@ -101,14 +101,15 @@ The v2 store lives below `~/.local/share/pi-bun/versions/v2/`. Existing `version
 
 ## Releases
 
-Pushing a SemVer tag creates a GitHub Release with four statically linked updater archives and a `checksums.txt` manifest through GoReleaser:
+Release Please owns the version decision, changelog, release PR, tag, and draft GitHub Release. Merging its release PR on `main` dispatches GoReleaser, which checks out the exact tag, builds four statically linked updater archives, publishes `checksums.txt`, and publishes the existing draft release:
 
-```bash
-git tag v0.1.0
-git push origin v0.1.0
-```
+1. Merge user-facing changes to `main` using Conventional Commits.
+2. Review and merge the Release Please pull request.
+3. Wait for the dispatched `Release` workflow to publish the tagged artifacts.
 
-The release workflow has only `contents: write` permission and runs from the tagged source. The public [`Nabsku/homebrew-tap`](https://github.com/Nabsku/homebrew-tap) independently checks for new releases and opens tested formula update pull requests; this repository holds no tap write credential.
+The `Release` workflow also has a manual recovery path. Supply an existing SemVer tag and, when available, its GitHub Release ID; it validates both before running GoReleaser and refuses to rerun against an already published release.
+
+The public [`Nabsku/homebrew-tap`](https://github.com/Nabsku/homebrew-tap) independently checks for new published releases and opens a tested formula update pull request for [`Formula/pi-bun-updater.rb`](https://github.com/Nabsku/homebrew-tap/blob/main/Formula/pi-bun-updater.rb). The tap workflow updates the source archive URL and SHA-256; dispatch its `Update pi-bun-updater` workflow manually if the formula PR is needed before the next scheduled run. This repository holds no tap write credential.
 
 ## Build every supported target
 

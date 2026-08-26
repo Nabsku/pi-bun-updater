@@ -3,7 +3,7 @@ version: 2
 
 before:
   hooks:
-    - go mod tidy
+    - go mod verify
     - go test ./...
 
 builds:
@@ -34,15 +34,10 @@ checksum:
   name_template: "checksums.txt"
 
 changelog:
-  sort: asc
-  filters:
-    exclude:
-      - "^docs:"
-      - "^test:"
+  disable: true
 
 release:
-  footer: >-
-
-    ---
-
-    Released by [GoReleaser](https://goreleaser.com).
+  use_existing_draft: true
+  draft: false
+  replace_existing_artifacts: true
+  mode: keep-existing

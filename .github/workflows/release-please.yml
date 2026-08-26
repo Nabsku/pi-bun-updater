@@ -1,0 +1,76 @@
+name: Release Please
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release-please-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    name: Open or create the release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run Release Please
+        id: release
+        uses: googleapis/release-please-action@8b8fd2cc23b2e18957157a9d923d75aa0c6f6ad5 # v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      - name: Dispatch artifact publication
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ steps.release.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            printf 'Release Please returned an invalid tag: %s\n' "$TAG_NAME" >&2
+            exit 1
+          fi
+
+          release_json=""
+          for attempt in {1..6}; do
+            if release_json="$(gh api --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
+              jq -c --arg tag "$TAG_NAME" '
+                (add // [])
+                | map(select(.tag_name == $tag and .draft == true))
+                | if length == 1 then .[0] else empty end'
+            )" && [[ -n "$release_json" ]]; then
+              break
+            fi
+
+            if [[ "$attempt" -eq 6 ]]; then
+              printf 'Could not resolve the draft release for %s after %s attempts.\n' "$TAG_NAME" "$attempt" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+
+          release_id="$(jq -r '.id' <<<"$release_json")"
+          release_tag="$(jq -r '.tag_name' <<<"$release_json")"
+          release_draft="$(jq -r '.draft' <<<"$release_json")"
+          if [[ ! "$release_id" =~ ^[0-9]+$ || "$release_tag" != "$TAG_NAME" || "$release_draft" != "true" ]]; then
+            printf 'Resolved release does not match the requested draft: id=%s tag=%s draft=%s\n' \
+              "$release_id" "$release_tag" "$release_draft" >&2
+            exit 1
+          fi
+
+          gh workflow run release.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref "$TAG_NAME" \
+            -f tag="$TAG_NAME" \
+            -f release_id="$release_id"
