@@ -21,6 +21,22 @@ Atomic replacement uses the native Linux/macOS rename-exchange primitive. If the
 
 There is intentionally no silent background updating. Run `pi-bun-update` when you choose to update, or use `status` / `update --check` from an explicit scheduler policy.
 
+## GitHub API access
+
+Release metadata is read through GitHub's API. Unauthenticated requests are
+subject to GitHub's per-IP rate limit. If the updater reports
+`GitHub API rate limit exceeded`, set `GH_TOKEN` or `GITHUB_TOKEN` for that
+command. The token is used only for GitHub API metadata requests; release
+archives and checksum downloads do not receive it.
+
+If GitHub CLI is already authenticated, use a one-shot token without writing
+it to shell history:
+
+```bash
+GH_TOKEN="$(gh auth token)" pi-bun-update status
+GH_TOKEN="$(gh auth token)" pi-bun-update update
+```
+
 ## Install
 
 ### Homebrew
